@@ -5,6 +5,7 @@
 
 mod config;
 mod git;
+mod key;
 mod roles;
 mod session;
 mod ui;
@@ -57,6 +58,20 @@ enum Command {
     },
     /// Set up this clone: your GitHub handle and which remotes to use.
     Configure,
+    /// Show what is on your YubiKey, and check it is ready to sign.
+    ///
+    /// Needs no repository and no configuration.
+    Key {
+        /// Which YubiKey, when more than one is plugged in.
+        #[arg(long)]
+        serial: Option<u32>,
+        /// Also sign a test message, to exercise the PIN and touch.
+        #[arg(long)]
+        sign_test: bool,
+        /// Print only the public key, for redirecting to a file.
+        #[arg(long, conflicts_with = "sign_test")]
+        pem: bool,
+    },
 }
 
 fn main() {
@@ -74,6 +89,11 @@ fn run() -> Result<()> {
         Some(Command::Init { event }) => init(&event),
         Some(Command::Delegate { event, role }) => delegate(&event, role.as_deref()),
         Some(Command::Status { event }) => status(event),
+        Some(Command::Key {
+            serial,
+            sign_test,
+            pem,
+        }) => key::run(serial, sign_test, pem),
         Some(Command::Configure) => {
             let git = git::Git::discover()?;
             let config = configure(&git)?;

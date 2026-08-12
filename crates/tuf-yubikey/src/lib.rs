@@ -26,7 +26,10 @@ use tuf_repo::crypto::KeyId;
 use tuf_repo::metadata::Key;
 use tuf_repo::signer::Signer;
 use yubikey::piv::{AlgorithmId, ManagementAlgorithmId, SlotId};
-use yubikey::{Serial, TouchPolicy, YubiKey};
+
+// Re-exported, so a caller can describe what this crate reports without depending on the
+// `yubikey` crate itself and risking a version skew between the two.
+pub use yubikey::{PinPolicy, Serial, TouchPolicy, Version, YubiKey};
 
 /// The PIV slot this tool signs with.
 const SLOT: SlotId = SlotId::Signature;
@@ -72,6 +75,37 @@ pub struct Device {
     pub reader: String,
     /// The YubiKey's serial number.
     pub serial: Serial,
+    /// The firmware version.
+    pub version: Version,
+}
+
+impl Device {
+    fn of(reader: String, yubikey: &YubiKey) -> Self {
+        Device {
+            reader,
+            serial: yubikey.serial(),
+            version: yubikey.version(),
+        }
+    }
+
+    /// The firmware version, as `ykman` writes it.
+    pub fn firmware(&self) -> String {
+        let Version {
+            major,
+            minor,
+            patch,
+        } = self.version;
+        format!("{major}.{minor}.{patch}")
+    }
+
+    /// Whether the firmware reports what a key slot holds.
+    ///
+    /// Slot metadata arrived in firmware 5.3. Below that the public key has to come from a
+    /// certificate written into the slot, which is why older keys need
+    /// `ykman piv certificates generate` and newer ones do not.
+    pub fn reports_slot_metadata(&self) -> bool {
+        (self.version.major, self.version.minor) >= (5, 3)
+    }
 }
 
 impl fmt::Display for Device {
@@ -89,10 +123,7 @@ pub fn devices() -> Result<Vec<Device>> {
         // A reader that is present but not answering is not worth failing over; it just is
         // not a YubiKey we can sign with.
         if let Ok(yubikey) = reader.open() {
-            devices.push(Device {
-                reader: name,
-                serial: yubikey.serial(),
-            });
+            devices.push(Device::of(name, &yubikey));
         }
     }
     Ok(devices)
@@ -122,12 +153,39 @@ pub struct SlotKey {
     pub key_id: KeyId,
     /// Whether the key requires a physical touch to sign.
     pub touch_policy: Option<TouchPolicy>,
+    /// When the PIN must be presented.
+    pub pin_policy: Option<PinPolicy>,
+    /// Whether the key was read from slot metadata rather than from a certificate.
+    pub from_slot_metadata: bool,
 }
 
 impl SlotKey {
     /// This key as a repository key belonging to `owner`.
     pub fn as_metadata_key(&self, owner: &str) -> tuf_repo::Result<(KeyId, Key)> {
         Key::from_pem(&self.public_pem, owner)
+    }
+
+    /// Whether signing will ask for a physical touch.
+    ///
+    /// `Default` for slot 9c means no touch, so an unset policy is reported as no touch
+    /// rather than as unknown.
+    pub fn needs_touch(&self) -> bool {
+        matches!(
+            self.touch_policy,
+            Some(TouchPolicy::Always | TouchPolicy::Cached)
+        )
+    }
+
+    /// Whether the PIN has to be presented before every single signature.
+    ///
+    /// Slot 9c defaults to this, which is the reason it is the slot this tool uses: each
+    /// signature needs the cardholder there for it, rather than one PIN unlocking a
+    /// session in which any number of things can be signed.
+    pub fn pin_every_time(&self) -> bool {
+        matches!(
+            self.pin_policy,
+            None | Some(PinPolicy::Default | PinPolicy::Always)
+        )
     }
 }
 
@@ -165,7 +223,7 @@ pub fn open(serial: Option<Serial>) -> Result<YubiKey> {
 /// fall back to the certificate in the slot, which is what `ykman piv certificates
 /// generate` puts there.
 pub fn slot_key(yubikey: &mut YubiKey) -> Result<SlotKey> {
-    let (spki_pem, touch_policy) = match yubikey::piv::metadata(yubikey, SLOT) {
+    let (spki_pem, policy, from_slot_metadata) = match yubikey::piv::metadata(yubikey, SLOT) {
         Ok(metadata) => {
             match metadata.algorithm {
                 ManagementAlgorithmId::Asymmetric(AlgorithmId::EccP256) => {}
@@ -173,7 +231,7 @@ pub fn slot_key(yubikey: &mut YubiKey) -> Result<SlotKey> {
             }
             let public = metadata.public.ok_or(Error::NoKey)?;
             let pem = spki_to_pem(&public)?;
-            (pem, metadata.policy.map(|(_, touch)| touch))
+            (pem, metadata.policy, true)
         }
         Err(_) => {
             let certificate =
@@ -183,7 +241,7 @@ pub fn slot_key(yubikey: &mut YubiKey) -> Result<SlotKey> {
                 .to_der()
                 .map_err(|err| Error::Key(err.to_string()))?;
             let pem = der_to_pem(&der)?;
-            (pem, None)
+            (pem, None, false)
         }
     };
 
@@ -191,7 +249,9 @@ pub fn slot_key(yubikey: &mut YubiKey) -> Result<SlotKey> {
     Ok(SlotKey {
         public_pem: spki_pem,
         key_id,
-        touch_policy,
+        touch_policy: policy.map(|(_, touch)| touch),
+        pin_policy: policy.map(|(pin, _)| pin),
+        from_slot_metadata,
     })
 }
 
@@ -230,10 +290,7 @@ impl<P: Prompt> YubikeySigner<P> {
     /// Open a YubiKey and prepare to sign with slot 9c.
     pub fn open(serial: Option<Serial>, prompt: P) -> Result<Self> {
         let mut yubikey = open(serial)?;
-        let device = Device {
-            reader: yubikey.name().to_owned(),
-            serial: yubikey.serial(),
-        };
+        let device = Device::of(yubikey.name().to_owned(), &yubikey);
         let key = slot_key(&mut yubikey)?;
         Ok(YubikeySigner {
             yubikey,
@@ -277,7 +334,7 @@ impl<P: Prompt> Signer for YubikeySigner<P> {
             tuf_repo::Error::Invalid(describe_pin_failure(err, remaining))
         })?;
 
-        if self.key.touch_policy != Some(TouchPolicy::Never) {
+        if self.key.needs_touch() {
             self.prompt.touch(&self.device);
         }
 
@@ -339,6 +396,66 @@ mod tests {
             describe_sign_failure(yubikey::Error::AuthenticationError).contains("touched"),
             "a missing touch must not be reported as an authentication failure"
         );
+    }
+
+    fn device(major: u8, minor: u8, patch: u8) -> Device {
+        Device {
+            reader: "reader".into(),
+            serial: 12345678.into(),
+            version: Version {
+                major,
+                minor,
+                patch,
+            },
+        }
+    }
+
+    fn slot_key(touch: Option<TouchPolicy>, pin: Option<PinPolicy>) -> SlotKey {
+        SlotKey {
+            public_pem: String::new(),
+            key_id: KeyId::for_pem(
+                "-----BEGIN PUBLIC KEY-----\n\
+                 MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEmcIqt4wpIdBCFSZv7EuQkTr7lHjR\n\
+                 kyR5EgRkaB5Am9Zc61orKQc9DiOTs5e9d84px3ebGh1NhzMGBUZHiGB1ow==\n\
+                 -----END PUBLIC KEY-----\n",
+            )
+            .unwrap(),
+            touch_policy: touch,
+            pin_policy: pin,
+            from_slot_metadata: true,
+        }
+    }
+
+    #[test]
+    fn slot_metadata_support_is_decided_by_firmware_version() {
+        assert!(device(5, 3, 0).reports_slot_metadata());
+        assert!(device(5, 4, 3).reports_slot_metadata());
+        assert!(device(6, 0, 0).reports_slot_metadata());
+        assert!(!device(5, 2, 7).reports_slot_metadata());
+        assert!(!device(4, 4, 5).reports_slot_metadata());
+        assert_eq!(device(5, 4, 3).firmware(), "5.4.3");
+    }
+
+    #[test]
+    fn touch_is_expected_only_when_the_policy_asks_for_it() {
+        assert!(slot_key(Some(TouchPolicy::Always), None).needs_touch());
+        assert!(slot_key(Some(TouchPolicy::Cached), None).needs_touch());
+        assert!(!slot_key(Some(TouchPolicy::Never), None).needs_touch());
+        // Slot 9c's default is no touch, and an unreadable policy must not make the tool
+        // sit waiting for one that will never come.
+        assert!(!slot_key(Some(TouchPolicy::Default), None).needs_touch());
+        assert!(!slot_key(None, None).needs_touch());
+    }
+
+    #[test]
+    fn the_pin_is_assumed_to_be_needed_every_time_unless_told_otherwise() {
+        assert!(slot_key(None, Some(PinPolicy::Always)).pin_every_time());
+        assert!(slot_key(None, Some(PinPolicy::Default)).pin_every_time());
+        // Unknown policy: assume the stricter behaviour, since presenting the PIN when it
+        // was not needed costs a prompt, and not presenting it fails the signature.
+        assert!(slot_key(None, None).pin_every_time());
+        assert!(!slot_key(None, Some(PinPolicy::Once)).pin_every_time());
+        assert!(!slot_key(None, Some(PinPolicy::Never)).pin_every_time());
     }
 
     #[test]
