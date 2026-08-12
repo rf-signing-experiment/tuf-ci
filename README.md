@@ -74,15 +74,75 @@ directly from slot metadata.
 
 ### As a repository
 
+A TUF repository is its own repository, separate from this one. This repository holds the
+tool and the action; that one holds `metadata/`, `targets/`, and the workflow below. The
+GitHub App, its secrets and the branch protection all belong to *that* repository — nothing
+here needs them.
+
 ```yaml
-# .github/workflows/signing-event.yml
+# <your-tuf-repo>/.github/workflows/signing-event.yml
 name: TUF signing event
 on:
   push:
     branches: ['sign/**']
 
-permissions: {}
+permissions: {}   # the App token carries its own
 
+jobs:
+  signing-event:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/create-github-app-token@v2   # pin by commit SHA
+        id: app-token
+        with:
+          app-id: ${{ vars.TUF_CI_APP_ID }}
+          private-key: ${{ secrets.TUF_CI_APP_PRIVATE_KEY }}
+
+      - uses: rf-signing-experiment/tuf-ci/actions/signing-event@<commit-sha>
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          app-slug: ${{ steps.app-token.outputs.app-slug }}
+```
+
+Require the `tuf-ci/signatures` check in branch protection on `main`, and a signing event
+cannot be merged until it has reached its thresholds.
+
+### The GitHub App
+
+Create one in the organisation that owns the repository, with these **repository
+permissions**, then install it on the TUF repository only:
+
+| Permission | Level | Why |
+|---|---|---|
+| Contents | Read and write | commit rebuilt targets metadata to the event branch |
+| Pull requests | Read and write | open and update the signing event pull request |
+| Checks | Read and write | publish the merge gate |
+| Metadata | Read-only | mandatory, selected for you |
+
+It needs no webhook. Store the App ID as the `TUF_CI_APP_ID` variable and the generated
+private key as the `TUF_CI_APP_PRIVATE_KEY` secret.
+
+An App rather than `GITHUB_TOKEN` because opening a pull request with `GITHUB_TOKEN`
+requires *Allow GitHub Actions to create and approve pull requests*, which many
+organisations disable and which cannot be re-enabled per repository. An App rather than a
+personal access token because the check-runs API rejects PATs outright — checks can only
+be created by an App — so a PAT would leave the repository with no merge gate.
+
+Passing `app-slug` attributes metadata commits to the App's own bot user. Without it they
+are authored by `github-actions[bot]`, which is cosmetic but misleading.
+
+Note that pushes made with an App token **do** trigger workflows, unlike `GITHUB_TOKEN`.
+Committing rebuilt targets metadata therefore starts a second run of this workflow. It is
+bounded at two and idempotent: the second run finds the metadata already in step with the
+artifacts and re-renders the same report.
+
+<details>
+<summary>Using GITHUB_TOKEN instead</summary>
+
+Workable if your organisation permits Actions to create pull requests, and if you do not
+mind losing the check run:
+
+```yaml
 jobs:
   signing-event:
     runs-on: ubuntu-latest
@@ -91,13 +151,16 @@ jobs:
       pull-requests: write   # open and update the signing event pull request
       checks: write          # publish the merge gate
     steps:
-      - uses: arlosi/tuf-ci/actions/signing-event@<commit-sha>
+      - uses: rf-signing-experiment/tuf-ci/actions/signing-event@<commit-sha>
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 ```
 
-Require the `tuf-ci/signatures` check in branch protection on `main`, and a signing event
-cannot be merged until it has reached its thresholds.
+`GITHUB_TOKEN` can create check runs, so the merge gate does work here. What it cannot do
+is open the pull request when the organisation setting is off; set
+`create-pull-request: false` and open it by hand in that case.
+
+</details>
 
 Adding an artifact is an ordinary commit:
 

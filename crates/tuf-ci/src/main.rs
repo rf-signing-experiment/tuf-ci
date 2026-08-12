@@ -188,6 +188,12 @@ fn git(repo: &Path, args: &[&str]) -> Result<String> {
 }
 
 /// Run git as the automation identity, for commits this tool makes itself.
+///
+/// These are a fallback, not a decision: `GIT_AUTHOR_*` and `GIT_COMMITTER_*` take
+/// precedence over `-c user.name`/`user.email`, so a caller running under a GitHub App
+/// sets those and the commits are attributed to the App's own bot user. Without them
+/// there would be no identity at all in a fresh runner checkout, and git would refuse to
+/// commit.
 fn git_as_bot(repo: &Path, args: &[&str]) -> Result<String> {
     let mut full = vec![
         "-c",

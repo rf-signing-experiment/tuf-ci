@@ -23,6 +23,13 @@ inputs:
     description: 'Open a pull request for the signing event if there is not one already.'
     required: false
     default: 'true'
+  app-slug:
+    description: >
+      The slug of the GitHub App whose token was passed as `token`, as produced by
+      actions/create-github-app-token. Metadata commits are then attributed to that App's
+      bot user instead of to github-actions[bot]. Leave unset when using GITHUB_TOKEN.
+    required: false
+    default: ''
 
 outputs:
   mergeable:
@@ -58,6 +65,37 @@ runs:
         chmod +x tuf-ci
         mv tuf-ci "${RUNNER_TEMP}/tuf-ci"
         echo "::endgroup::"
+
+    # Commits this action makes should come from whoever the token belongs to. git reads
+    # GIT_AUTHOR_*/GIT_COMMITTER_* in preference to any configured user.name, so exporting
+    # them here overrides tuf-ci's built-in fallback identity.
+    - name: Resolve the committer identity
+      if: inputs.app-slug != ''
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        APP_SLUG: ${{ inputs.app-slug }}
+      run: |
+        set -uo pipefail
+        # A bot user's no-reply address is <numeric id>+<login>@users.noreply.github.com,
+        # and only that exact form gets linked to the App on github.com.
+        login="${APP_SLUG}[bot]"
+        if ! id=$(gh api "/users/${APP_SLUG}%5Bbot%5D" --jq .id 2>&1); then
+          # Attribution is cosmetic. Falling back to tuf-ci's built-in identity is far
+          # better than failing a signing event over the name on a commit.
+          echo "::warning::Could not look up the ${login} user (${id}); metadata commits" \
+               "will be authored by github-actions[bot] instead."
+          exit 0
+        fi
+        email="${id}+${login}@users.noreply.github.com"
+
+        for var in GIT_AUTHOR_NAME GIT_COMMITTER_NAME; do
+          echo "${var}=${login}" >> "$GITHUB_ENV"
+        done
+        for var in GIT_AUTHOR_EMAIL GIT_COMMITTER_EMAIL; do
+          echo "${var}=${email}" >> "$GITHUB_ENV"
+        done
+        echo "Metadata commits will be authored by ${login} <${email}>"
 
     - name: Update targets metadata
       shell: bash
