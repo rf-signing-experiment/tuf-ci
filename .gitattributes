@@ -1,0 +1,3 @@
+# Metadata bytes are what signatures cover: no line-ending translation, ever.
+*.json -text
+*.sig.json -text

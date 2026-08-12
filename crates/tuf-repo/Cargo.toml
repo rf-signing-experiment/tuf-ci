@@ -1,0 +1,28 @@
+[package]
+name = "tuf-repo"
+description = "TUF metadata model and signing-event state machine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+# A software signer, for tests in this workspace. Never enable in a shipped binary.
+testing = []
+
+[dependencies]
+base64.workspace = true
+chrono.workspace = true
+dsse.workspace = true
+hex.workspace = true
+p256.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+spki.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tuf-repo = { path = ".", features = ["testing"] }
+base64.workspace = true
+tempfile = "3"

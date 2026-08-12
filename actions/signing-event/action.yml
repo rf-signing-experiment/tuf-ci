@@ -1,0 +1,112 @@
+name: 'TUF signing event'
+description: 'Update targets metadata, report signing status on the pull request, and gate the merge on a check run.'
+
+# Everything happens in one job. The Python implementation has to stop after committing a
+# metadata update and re-dispatch itself, because it relies on the push event to compute
+# status afterwards; here the updated state is already in hand, so the report is generated
+# from it directly.
+#
+# Required permissions on the calling job:
+#   contents: write        to commit rebuilt targets metadata to the event branch
+#   pull-requests: write   to open and update the signing event pull request
+#   checks: write          to publish the merge gate
+
+inputs:
+  token:
+    description: 'GitHub token. Needs contents, pull-requests and checks write access.'
+    required: true
+  base-branch:
+    description: 'The branch signing events are merged into.'
+    required: false
+    default: 'main'
+  create-pull-request:
+    description: 'Open a pull request for the signing event if there is not one already.'
+    required: false
+    default: 'true'
+
+outputs:
+  mergeable:
+    description: '"true" when every changed role has reached its signature threshold.'
+    value: ${{ steps.status.outputs.mergeable }}
+
+runs:
+  using: 'composite'
+  steps:
+    - uses: actions/checkout@v4
+      with:
+        token: ${{ inputs.token }}
+        # The whole history: status is computed against the commit the event branched
+        # from, which a shallow clone would not contain.
+        fetch-depth: 0
+        persist-credentials: true
+
+    - name: Install tuf-ci
+      shell: bash
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+      run: |
+        set -euo pipefail
+        source "$ACTION_PATH/version.env"
+
+        url="https://github.com/${TUF_CI_REPO}/releases/download/${TUF_CI_VERSION}/tuf-ci-x86_64-unknown-linux-musl"
+        echo "::group::Install tuf-ci ${TUF_CI_VERSION}"
+        curl --fail --silent --show-error --location --retry 3 --output tuf-ci "$url"
+
+        # The digest is committed alongside this action, so pinning the action by commit
+        # SHA pins the exact binary it will run.
+        echo "${TUF_CI_SHA256}  tuf-ci" | sha256sum --check --strict
+        chmod +x tuf-ci
+        mv tuf-ci "${RUNNER_TEMP}/tuf-ci"
+        echo "::endgroup::"
+
+    - name: Update targets metadata
+      shell: bash
+      env:
+        BASE_BRANCH: ${{ inputs.base-branch }}
+      run: |
+        set -euo pipefail
+        # Exit 1 means "nothing needed doing", which is not a failure. Only exit 2 is.
+        set +e
+        "${RUNNER_TEMP}/tuf-ci" --base-branch "$BASE_BRANCH" update-targets --push
+        code=$?
+        set -e
+        if [ "$code" -gt 1 ]; then exit "$code"; fi
+
+    - name: Signing event status
+      id: status
+      shell: bash
+      env:
+        BASE_BRANCH: ${{ inputs.base-branch }}
+      run: |
+        set -euo pipefail
+        set +e
+        "${RUNNER_TEMP}/tuf-ci" --base-branch "$BASE_BRANCH" status > report.md
+        code=$?
+        set -e
+        if [ "$code" -gt 1 ]; then cat report.md; exit "$code"; fi
+
+        cat report.md
+        cat report.md >> "$GITHUB_STEP_SUMMARY"
+        if [ "$code" -eq 0 ]; then
+          echo "mergeable=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "mergeable=false" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Report on the pull request
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ inputs.token }}
+        BASE_BRANCH: ${{ inputs.base-branch }}
+        CREATE_PR: ${{ inputs.create-pull-request }}
+      run: |
+        set -euo pipefail
+        args=()
+        if [ "$CREATE_PR" != "true" ]; then args+=(--no-create); fi
+
+        set +e
+        "${RUNNER_TEMP}/tuf-ci" --base-branch "$BASE_BRANCH" pr-update "${args[@]}"
+        code=$?
+        set -e
+        # Exit 1 only says the event is not signed yet; the report was still published.
+        if [ "$code" -gt 1 ]; then exit "$code"; fi

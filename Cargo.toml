@@ -1,0 +1,38 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/tuf-repo",
+    "crates/tuf-yubikey",
+    "crates/tuf-sign",
+    "crates/tuf-ci",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88.0"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+tuf-repo = { path = "crates/tuf-repo" }
+tuf-yubikey = { path = "crates/tuf-yubikey" }
+
+dsse = { git = "https://github.com/rf-signing-experiment/rust-tuf.git", branch = "tbdsigning" }
+
+anyhow = "1"
+base64 = "0.22"
+chrono = { version = "0.4.42", default-features = false, features = ["std", "clock", "serde"] }
+clap = { version = "4", features = ["derive"] }
+hex = "0.4"
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "pem", "std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+spki = { version = "0.7", features = ["alloc", "pem"] }
+thiserror = "2"
+ureq = { version = "3", features = ["json"] }
+yubikey = "0.8"
+inquire = "0.9"
+owo-colors = "4"
+toml = "0.9"
+tempfile = "3"

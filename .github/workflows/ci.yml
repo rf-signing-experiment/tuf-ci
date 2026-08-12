@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions: {}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # tuf-yubikey talks to smart cards over PC/SC, so it needs the client library to
+      # link even though no card is present in CI.
+      - name: Install libpcsclite
+        run: sudo apt-get update && sudo apt-get install --yes libpcsclite-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- --deny warnings
+      - run: cargo test --workspace

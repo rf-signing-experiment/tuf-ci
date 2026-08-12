@@ -1,0 +1,24 @@
+[package]
+name = "tuf-ci"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+tuf-repo.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+ureq.workspace = true
+
+[[bin]]
+name = "tuf-ci"
+path = "src/main.rs"
+
+[dev-dependencies]
+tuf-repo = { path = "../tuf-repo", features = ["testing"] }
+tempfile.workspace = true
+chrono.workspace = true
+serde_json.workspace = true
