@@ -527,6 +527,44 @@ fn artifacts_are_assigned_to_the_role_that_owns_their_directory() {
 }
 
 #[test]
+fn housekeeping_dotfiles_are_not_signed_as_artifacts() {
+    let mut repo = Repo::new();
+    bootstrap(&mut repo, &["@alice"], 1);
+
+    let crates: RoleName = "crates".parse().unwrap();
+    let mut event = repo.event();
+    event
+        .configure_role(&crates, &config(&["@alice"], 1))
+        .unwrap();
+    let alice_key = MemorySigner::for_owner("@alice").public_key().1;
+    event.accept_invite(&crates, "@alice", alice_key).unwrap();
+    repo.merge(&event);
+
+    let mut files = Files::default();
+    // The kind of thing that ends up in a repository without anybody deciding it should.
+    repo.add_artifact(&mut files, ".gitkeep", b"");
+    repo.add_artifact(&mut files, ".DS_Store", b"junk");
+    repo.add_artifact(&mut files, "crates/.gitkeep", b"");
+    repo.add_artifact(&mut files, "real.txt", b"an actual artifact");
+
+    let mut event = repo.event_with(&files);
+    let mut artifacts = repo.main.clone();
+    artifacts.0.extend(files.0.clone());
+    let updated = event.update_targets(&artifacts).unwrap();
+
+    assert_eq!(
+        updated,
+        [RoleName::targets()],
+        "only the role with a real artifact should change"
+    );
+    assert_eq!(
+        event.artifact_changes(&RoleName::targets()),
+        [ArtifactChange::Added("real.txt".into())],
+    );
+    assert!(event.artifact_changes(&crates).is_empty());
+}
+
+#[test]
 fn changing_an_artifact_is_reported_as_a_modification() {
     let mut repo = Repo::new();
     bootstrap(&mut repo, &["@alice"], 1);

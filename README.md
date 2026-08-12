@@ -79,6 +79,22 @@ tool and the action; that one holds `metadata/`, `targets/`, and the workflow be
 GitHub App, its secrets and the branch protection all belong to *that* repository — nothing
 here needs them.
 
+Set it up in this order. The workflow has to reach the base branch **before** the first
+signing event, because a `push` event runs the workflow as it exists in the pushed commit,
+not the one on the base branch — so a `sign/*` branch cut from a base branch without the
+workflow will push successfully and then do nothing at all.
+
+1. Create the repository from the
+   [template repository](https://github.com/rf-signing-experiment/tuf-repository), which
+   carries the workflow, a `.gitattributes` that keeps signature-covered bytes from being
+   mangled, and an empty `targets/`. Delete the template's `metadata/`.
+2. Repoint the `uses:` in `.github/workflows/signing-event.yml` at the `tuf-ci` commit you
+   want to run.
+3. Create the GitHub App, install it on the new repository, and add `TUF_CI_APP_ID` and
+   `TUF_CI_APP_PRIVATE_KEY`.
+4. Push all of that to `main`.
+5. Only now run `tuf-sign init sign/init`.
+
 ```yaml
 # <your-tuf-repo>/.github/workflows/signing-event.yml
 name: TUF signing event

@@ -1005,6 +1005,9 @@ impl SigningEvent {
                 else {
                     continue;
                 };
+                if is_hidden(relative) {
+                    continue;
+                }
                 if !patterns
                     .iter()
                     .any(|pattern| path_matches(pattern, relative))
@@ -1266,6 +1269,17 @@ impl SigningEvent {
         self.touch(role)?;
         Ok(true)
     }
+}
+
+/// Whether any component of `path` starts with a dot.
+///
+/// Dotfiles under `targets/` are housekeeping, not artifacts: a `.gitkeep` holding an
+/// empty directory open, a `.gitignore`, a `.DS_Store` somebody's file manager left
+/// behind. Signing those and publishing them to every client is never what was meant, and
+/// the mistake is silent, so they are skipped. An artifact that genuinely has to be
+/// published under a dotted name needs a role whose paths name it explicitly.
+fn is_hidden(path: &str) -> bool {
+    path.split('/').any(|component| component.starts_with('.'))
 }
 
 /// A delegating payload being edited in place.
