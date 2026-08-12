@@ -90,8 +90,8 @@ workflow will push successfully and then do nothing at all.
    mangled, and an empty `targets/`. Delete the template's `metadata/`.
 2. Repoint the `uses:` in `.github/workflows/signing-event.yml` at the `tuf-ci` commit you
    want to run.
-3. Create the GitHub App, install it on the new repository, and add `TUF_CI_APP_ID` and
-   `TUF_CI_APP_PRIVATE_KEY`.
+3. Create the GitHub App, **install it on the new repository**, and add
+   `TUF_CI_APP_CLIENT_ID` and `TUF_CI_APP_PRIVATE_KEY`.
 4. Push all of that to `main`.
 5. Only now run `tuf-sign init sign/init`.
 
@@ -108,10 +108,10 @@ jobs:
   signing-event:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/create-github-app-token@v2   # pin by commit SHA
+      - uses: actions/create-github-app-token@v3   # pin by commit SHA
         id: app-token
         with:
-          app-id: ${{ vars.TUF_CI_APP_ID }}
+          client-id: ${{ vars.TUF_CI_APP_CLIENT_ID }}
           private-key: ${{ secrets.TUF_CI_APP_PRIVATE_KEY }}
 
       - uses: rf-signing-experiment/tuf-ci/actions/signing-event@<commit-sha>
@@ -135,8 +135,15 @@ permissions**, then install it on the TUF repository only:
 | Checks | Read and write | publish the merge gate |
 | Metadata | Read-only | mandatory, selected for you |
 
-It needs no webhook. Store the App ID as the `TUF_CI_APP_ID` variable and the generated
-private key as the `TUF_CI_APP_PRIVATE_KEY` secret.
+It needs no webhook. Store the App's **Client ID** (`Iv23li…`, on the App's settings page
+— not its numeric App ID, which the token action has deprecated) as the
+`TUF_CI_APP_CLIENT_ID` variable, and the generated private key as the
+`TUF_CI_APP_PRIVATE_KEY` secret.
+
+**Installing the App is a separate step from creating it.** An App that exists but is not
+installed on the repository authenticates fine and then fails with
+`Not Found — /repos/{owner}/{repo}/installation`, which reads like a missing repository
+rather than a missing installation.
 
 An App rather than `GITHUB_TOKEN` because opening a pull request with `GITHUB_TOKEN`
 requires *Allow GitHub Actions to create and approve pull requests*, which many
