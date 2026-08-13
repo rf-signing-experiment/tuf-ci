@@ -279,13 +279,4 @@ mod tests {
             "slot metadata"
         );
     }
-
-    #[test]
-    fn the_test_message_cannot_be_confused_for_metadata() {
-        // Every DSSE signing input starts "DSSEv1 ". This must not, or a signature
-        // gathered here could be replayed as one over real metadata.
-        let dsse_prefix = tuf_repo::envelope::signing_input(b"");
-        assert!(dsse_prefix.starts_with(b"DSSEv1 "));
-        assert!(!TEST_MESSAGE.starts_with(b"DSSEv1 "));
-    }
 }

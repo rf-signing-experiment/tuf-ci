@@ -11,9 +11,9 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use dsse::{DsseSignature, SignatureBytes};
 use serde::{Deserialize, Serialize};
 
-use crate::envelope::{self, Signatures};
 use crate::error::{Error, Result};
 use crate::metadata::{Delegator, Payload, RoleName, Root, Snapshot, Targets, Timestamp};
 use crate::ser;
@@ -224,7 +224,17 @@ impl Source for EmptySource {
 pub struct Signed<P> {
     raw: Vec<u8>,
     payload: P,
-    signatures: Signatures,
+    signatures: Vec<DsseSignature>,
+}
+
+/// The on-disk shape of a `<role>.sig.json`.
+///
+/// An object rather than a bare array, so the same key names the signatures here and in a
+/// published envelope, and so the file can gain a field later without changing shape.
+#[derive(Default, Serialize, Deserialize)]
+struct SignatureFile {
+    #[serde(default)]
+    signatures: Vec<DsseSignature>,
 }
 
 impl<P: Payload> Signed<P> {
@@ -233,12 +243,12 @@ impl<P: Payload> Signed<P> {
         Ok(Signed {
             raw: ser::to_bytes(&payload)?,
             payload,
-            signatures: Signatures::new(),
+            signatures: Vec::new(),
         })
     }
 
     /// Parse a payload file and its signature file.
-    pub fn parse(raw: Vec<u8>, signatures: Signatures) -> Result<Self> {
+    pub fn parse(raw: Vec<u8>, signatures: Vec<DsseSignature>) -> Result<Self> {
         let payload: P = serde_json::from_slice(&raw)?;
         payload.check_type()?;
         Ok(Signed {
@@ -259,13 +269,20 @@ impl<P: Payload> Signed<P> {
     }
 
     /// The signatures gathered so far.
-    pub fn signatures(&self) -> &Signatures {
+    pub fn signatures(&self) -> &[DsseSignature] {
         &self.signatures
+    }
+
+    /// The bytes of this document's `.sig.json` file.
+    pub fn signature_file(&self) -> Result<Vec<u8>> {
+        ser::to_bytes(&SignatureFile {
+            signatures: self.signatures.clone(),
+        })
     }
 
     /// The bytes that a signature over this payload is computed over.
     pub fn signing_input(&self) -> Vec<u8> {
-        envelope::signing_input(&self.raw)
+        dsse::pae(tuf::pouf::PAYLOAD_TYPE, &self.raw)
     }
 
     /// Replace the payload, discarding every signature.
@@ -294,10 +311,22 @@ impl<P: Payload> Signed<P> {
         Ok(true)
     }
 
-    /// Record a signature over the current payload bytes.
+    /// Record a signature over the current payload bytes, replacing any previous one by
+    /// the same key.
+    ///
+    /// Entries are kept sorted by key id: two signers adding signatures concurrently then
+    /// produce the same file whichever order the commits land in, which keeps merge
+    /// conflicts to the genuine ones.
     pub fn add_signature(&mut self, key_id: crate::crypto::KeyId, signature: &[u8]) {
         self.signatures
-            .insert(envelope::Signature::new(key_id, signature));
+            .retain(|existing| existing.keyid.as_str() != key_id.as_str());
+        self.signatures.push(DsseSignature::new(
+            SignatureBytes::from_bytes(signature),
+            dsse::KeyId::new(key_id.to_string()),
+        ));
+        // By `as_str`, because `dsse::KeyId` is `Eq` but not `Ord`.
+        self.signatures
+            .sort_by(|a, b| a.keyid.as_str().cmp(b.keyid.as_str()));
     }
 
     /// Sign the current payload bytes with `signer`.
@@ -348,12 +377,13 @@ impl<P: Payload> Signed<P> {
                 key_id: key_id.clone(),
                 name: key.signer_name().to_owned(),
             };
-            match self.signatures.get(key_id) {
+            match self
+                .signatures
+                .iter()
+                .find(|signature| signature.keyid.as_str() == key_id.as_str())
+            {
                 None => tally.missing.push(who),
-                Some(signature) => match signature
-                    .decode()
-                    .and_then(|bytes| key.verify(&message, &bytes))
-                {
+                Some(signature) => match key.verify(&message, signature.sig.as_bytes()) {
                     Ok(()) => tally.signed.push(who),
                     Err(_) => tally.invalid.push(who),
                 },
@@ -632,10 +662,10 @@ fn role_of_metadata_path(path: &str) -> Option<RoleName> {
     stem.parse().ok()
 }
 
-fn read_signatures(source: &dyn Source, role: &RoleName) -> Result<Signatures> {
+fn read_signatures(source: &dyn Source, role: &RoleName) -> Result<Vec<DsseSignature>> {
     match source.read(&signature_path(role))? {
-        Some(raw) => Ok(serde_json::from_slice(&raw)?),
-        None => Ok(Signatures::new()),
+        Some(raw) => Ok(serde_json::from_slice::<SignatureFile>(&raw)?.signatures),
+        None => Ok(Vec::new()),
     }
 }
 
@@ -661,14 +691,14 @@ impl Writer {
     /// that trusts an old root can walk forward to the current one.
     pub fn write_role<P: Payload>(&self, role: &RoleName, signed: &Signed<P>) -> Result<()> {
         self.write(&payload_path(role), signed.raw())?;
-        self.write(&signature_path(role), &ser::to_bytes(signed.signatures())?)?;
+        self.write(&signature_path(role), &signed.signature_file()?)?;
 
         if *role == RoleName::root() {
             let version = signed.payload().version();
             self.write(&root_history_payload_path(version), signed.raw())?;
             self.write(
                 &root_history_signature_path(version),
-                &ser::to_bytes(signed.signatures())?,
+                &signed.signature_file()?,
             )?;
         }
         Ok(())
@@ -731,6 +761,66 @@ mod tests {
         assert_eq!(role("metadata/root_history/1.root.json"), None);
         assert_eq!(role("metadata/README.md"), None);
         assert_eq!(role("targets/root.json"), None);
+    }
+
+    #[test]
+    fn the_signature_file_format_is_fixed() {
+        // A real key id and signature, in the layout this crate writes. Nothing verifies
+        // against these bytes — signatures cover the payload file — but a change in field
+        // order, indentation or base64 dialect would rewrite every signature file in a
+        // repository, and these diffs are what reviewers read.
+        const FILE: &str = r#"{
+  "signatures": [
+    {
+      "sig": "MEUCIQDh632FEh1JHYqSMGJgdH/djiDyv31xT1bYgPyPBsF0IwIgXas0UGf023NZKEgyy3y4JPVhzq8Ed0x/yeraHtnV3FU=",
+      "keyid": "bd828d85ebaa1d4a1e59773e5056d384b87f98db8604b77f76af056d36b8e6f9"
+    }
+  ]
+}
+"#;
+
+        let parsed: SignatureFile = serde_json::from_slice(FILE.as_bytes()).unwrap();
+        assert_eq!(ser::to_bytes(&parsed).unwrap(), FILE.as_bytes());
+    }
+
+    #[test]
+    fn signatures_are_ordered_and_replaced_rather_than_duplicated() {
+        use crate::crypto::KeyId;
+        use std::str::FromStr;
+
+        let key = |s: &str| KeyId::from_str(s).unwrap();
+        let root = || {
+            Root::empty(
+                chrono::Utc::now(),
+                crate::metadata::Periods {
+                    expiry_days: 365,
+                    signing_days: 60,
+                },
+            )
+        };
+        let signatures = |doc: &Signed<Root>| -> Vec<String> {
+            doc.signatures()
+                .iter()
+                .map(|s| format!("{}:{}", s.keyid, s.sig))
+                .collect()
+        };
+
+        // Two signers, signing in either order, must produce the same file: whichever
+        // commit lands second should merge, not conflict.
+        let mut forwards = Signed::new(root()).unwrap();
+        forwards.add_signature(key("aaa"), b"1");
+        forwards.add_signature(key("bbb"), b"2");
+
+        let mut backwards = Signed::new(root()).unwrap();
+        backwards.add_signature(key("bbb"), b"2");
+        backwards.add_signature(key("aaa"), b"1");
+
+        assert_eq!(signatures(&forwards), signatures(&backwards));
+
+        // Signing again replaces: a role must never appear to have met its threshold on
+        // the strength of one key signing twice.
+        backwards.add_signature(key("aaa"), b"again");
+        assert_eq!(backwards.signatures().len(), 2);
     }
 
     #[test]

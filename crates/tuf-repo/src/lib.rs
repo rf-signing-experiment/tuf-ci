@@ -28,7 +28,6 @@
 #![deny(missing_docs)]
 
 pub mod crypto;
-pub mod envelope;
 pub mod error;
 pub mod event;
 pub mod metadata;

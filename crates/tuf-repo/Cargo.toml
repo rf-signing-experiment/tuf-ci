@@ -11,7 +11,6 @@ license.workspace = true
 testing = []
 
 [dependencies]
-base64.workspace = true
 chrono.workspace = true
 dsse.workspace = true
 hex.workspace = true
@@ -21,6 +20,7 @@ serde_json.workspace = true
 sha2.workspace = true
 spki.workspace = true
 thiserror.workspace = true
+tuf.workspace = true
 
 [dev-dependencies]
 tuf-repo = { path = ".", features = ["testing"] }
