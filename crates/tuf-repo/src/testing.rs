@@ -36,7 +36,7 @@ impl MemorySigner {
             .verifying_key()
             .to_public_key_pem(p256::pkcs8::LineEnding::LF)
             .expect("a P-256 public key is encodable");
-        let key_id = KeyId::for_pem(&public_pem).expect("a freshly encoded key parses");
+        let key_id = crypto::key_id(&public_pem).expect("a freshly encoded key parses");
 
         MemorySigner {
             signing_key,

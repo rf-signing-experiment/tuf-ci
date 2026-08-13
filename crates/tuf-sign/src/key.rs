@@ -162,6 +162,7 @@ fn verify_signing(device: &Device, key: &SlotKey) -> Result<bool> {
     };
 
     match crypto::verify(
+        crypto::KEYTYPE_ECDSA,
         crypto::ECDSA_SHA2_NISTP256,
         &key.public_pem,
         TEST_MESSAGE,
@@ -222,12 +223,11 @@ fn source(key: &SlotKey, device: &Device) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tuf_repo::crypto::KeyId;
 
     fn slot_key(pin: Option<PinPolicy>, touch: Option<TouchPolicy>, meta: bool) -> SlotKey {
         SlotKey {
             public_pem: String::new(),
-            key_id: KeyId::for_pem(
+            key_id: crypto::key_id(
                 "-----BEGIN PUBLIC KEY-----\n\
                  MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEmcIqt4wpIdBCFSZv7EuQkTr7lHjR\n\
                  kyR5EgRkaB5Am9Zc61orKQc9DiOTs5e9d84px3ebGh1NhzMGBUZHiGB1ow==\n\

@@ -17,7 +17,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, Duration, Utc};
 
-use crate::crypto::KeyId;
+use crate::crypto::{self, KeyId};
 use crate::error::{Error, Result};
 use crate::metadata::{Delegator, Key, Periods, RoleName, Root, TargetFile, Targets, path_matches};
 use crate::signer::Signer;
@@ -633,7 +633,7 @@ impl SigningEvent {
                         problems.push(format!(
                             "{role} may be signed by key {}, which the delegating role does not \
                              hold",
-                            key_id.abbreviated()
+                            crypto::abbreviated(key_id)
                         ));
                     }
                 }
@@ -647,11 +647,11 @@ impl SigningEvent {
                 match (role.is_online(), &key.owner, &key.online_uri) {
                     (false, None, _) => problems.push(format!(
                         "{role} key {} has no owner, so nobody can be asked to sign with it",
-                        key_id.abbreviated()
+                        crypto::abbreviated(&key_id)
                     )),
                     (true, _, None) => problems.push(format!(
                         "{role} is signed online but key {} has no signing URI",
-                        key_id.abbreviated()
+                        crypto::abbreviated(&key_id)
                     )),
                     _ => {}
                 }
@@ -739,16 +739,16 @@ impl SigningEvent {
         // Every key id must name the key it is filed under, or a client resolving a
         // delegation would fetch a key the metadata did not intend.
         for (key_id, key) in &root.keys {
-            match KeyId::for_pem(&key.keyval.public) {
+            match key.derived_key_id() {
                 Ok(derived) if derived == *key_id => {}
                 Ok(derived) => problems.push(format!(
                     "root key {} does not match its own key material, which hashes to {}",
-                    key_id.abbreviated(),
-                    derived.abbreviated()
+                    crypto::abbreviated(key_id),
+                    crypto::abbreviated(&derived)
                 )),
                 Err(err) => problems.push(format!(
                     "root key {} cannot be read: {err}",
-                    key_id.abbreviated()
+                    crypto::abbreviated(key_id)
                 )),
             }
         }
@@ -893,7 +893,7 @@ impl SigningEvent {
         }
         timestamp.validate(&RoleName::timestamp())?;
         snapshot.validate(&RoleName::snapshot())?;
-        let key_id = KeyId::for_pem(&key.keyval.public)?;
+        let key_id = key.derived_key_id()?;
 
         let signed = self
             .current
@@ -936,7 +936,7 @@ impl SigningEvent {
                 "key is marked as belonging to {owner:?}, but is being contributed by {user:?}"
             )));
         }
-        let key_id = KeyId::for_pem(&key.keyval.public)?;
+        let key_id = key.derived_key_id()?;
 
         let periods = self
             .current
@@ -1071,7 +1071,7 @@ impl SigningEvent {
         if !permitted {
             return Err(Error::invalid(format!(
                 "key {} is not permitted to sign {role}",
-                signer.key_id().abbreviated()
+                crypto::abbreviated(signer.key_id())
             )));
         }
 
@@ -1295,7 +1295,7 @@ fn quorum_of(delegator: &Delegator, role: &RoleName) -> Option<Quorum> {
         .iter()
         .map(|key_id| match delegator.key(key_id) {
             Some(key) => key.signer_name().to_owned(),
-            None => format!("<unknown key {}>", key_id.abbreviated()),
+            None => format!("<unknown key {}>", crypto::abbreviated(key_id)),
         })
         .collect();
     signers.sort();

@@ -162,7 +162,7 @@ impl Key {
     ///
     /// Returns the key alongside the [`KeyId`] it will be filed under.
     pub fn from_pem(pem: &str, owner: &str) -> Result<(KeyId, Key)> {
-        let key_id = KeyId::for_pem(pem)?;
+        let key_id = crypto::key_id(pem)?;
         let key = Key {
             keytype: crypto::KEYTYPE_ECDSA.into(),
             scheme: crypto::ECDSA_SHA2_NISTP256.into(),
@@ -198,7 +198,25 @@ impl Key {
 
     /// Verify `signature` over `message` with this key.
     pub fn verify(&self, message: &[u8], signature: &[u8]) -> Result<()> {
-        crypto::verify(&self.scheme, &self.keyval.public, message, signature)
+        crypto::verify(
+            &self.keytype,
+            &self.scheme,
+            &self.keyval.public,
+            message,
+            signature,
+        )
+    }
+
+    /// The id this key's own material gives it.
+    ///
+    /// A key is filed in metadata under an id that nothing forces to match its contents,
+    /// so this is what that claim is checked against.
+    pub fn derived_key_id(&self) -> Result<KeyId> {
+        Ok(
+            crypto::parse(&self.keytype, &self.scheme, &self.keyval.public)?
+                .key_id()
+                .clone(),
+        )
     }
 }
 

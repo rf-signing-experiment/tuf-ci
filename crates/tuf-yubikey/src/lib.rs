@@ -22,7 +22,7 @@ use std::fmt;
 
 use sha2::{Digest, Sha256};
 use spki::der::Encode;
-use tuf_repo::crypto::KeyId;
+use tuf_repo::crypto::{self, KeyId};
 use tuf_repo::metadata::Key;
 use tuf_repo::signer::Signer;
 use yubikey::piv::{AlgorithmId, ManagementAlgorithmId, SlotId};
@@ -245,7 +245,7 @@ pub fn slot_key(yubikey: &mut YubiKey) -> Result<SlotKey> {
         }
     };
 
-    let key_id = KeyId::for_pem(&spki_pem).map_err(|err| Error::Key(err.to_string()))?;
+    let key_id = crypto::key_id(&spki_pem).map_err(|err| Error::Key(err.to_string()))?;
     Ok(SlotKey {
         public_pem: spki_pem,
         key_id,
@@ -413,7 +413,7 @@ mod tests {
     fn slot_key(touch: Option<TouchPolicy>, pin: Option<PinPolicy>) -> SlotKey {
         SlotKey {
             public_pem: String::new(),
-            key_id: KeyId::for_pem(
+            key_id: crypto::key_id(
                 "-----BEGIN PUBLIC KEY-----\n\
                  MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEmcIqt4wpIdBCFSZv7EuQkTr7lHjR\n\
                  kyR5EgRkaB5Am9Zc61orKQc9DiOTs5e9d84px3ebGh1NhzMGBUZHiGB1ow==\n\

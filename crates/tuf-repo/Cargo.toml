@@ -7,14 +7,15 @@ rust-version.workspace = true
 license.workspace = true
 
 [features]
-# A software signer, for tests in this workspace. Never enable in a shipped binary.
-testing = []
+# A software signer, for tests in this workspace. Never enable in a shipped binary — the
+# private-key implementation it needs is not compiled in without it.
+testing = ["dep:p256"]
 
 [dependencies]
 chrono.workspace = true
 dsse.workspace = true
 hex.workspace = true
-p256.workspace = true
+p256 = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

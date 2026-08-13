@@ -14,6 +14,7 @@ use std::process::Command;
 use dsse::{DsseSignature, SignatureBytes};
 use serde::{Deserialize, Serialize};
 
+use crate::crypto;
 use crate::error::{Error, Result};
 use crate::metadata::{Delegator, Payload, RoleName, Root, Snapshot, Targets, Timestamp};
 use crate::ser;
@@ -322,11 +323,9 @@ impl<P: Payload> Signed<P> {
             .retain(|existing| existing.keyid.as_str() != key_id.as_str());
         self.signatures.push(DsseSignature::new(
             SignatureBytes::from_bytes(signature),
-            dsse::KeyId::new(key_id.to_string()),
+            dsse::KeyId::new(key_id.as_str().to_owned()),
         ));
-        // By `as_str`, because `dsse::KeyId` is `Eq` but not `Ord`.
-        self.signatures
-            .sort_by(|a, b| a.keyid.as_str().cmp(b.keyid.as_str()));
+        self.signatures.sort_by(|a, b| a.keyid.cmp(&b.keyid));
     }
 
     /// Sign the current payload bytes with `signer`.
@@ -337,8 +336,9 @@ impl<P: Payload> Signed<P> {
         // Check our own work before storing it: a signing device that returns a signature
         // over the wrong bytes, or with the wrong key, should be caught here rather than
         // by CI after the signer has gone home.
-        crate::crypto::verify(
-            crate::crypto::ECDSA_SHA2_NISTP256,
+        crypto::verify(
+            crypto::KEYTYPE_ECDSA,
+            crypto::ECDSA_SHA2_NISTP256,
             signer.public_key_pem(),
             &self.signing_input(),
             &signature,
@@ -369,7 +369,7 @@ impl<P: Payload> Signed<P> {
                 // satisfied. Report it as an unusable signer rather than ignoring it.
                 tally.invalid.push(SignerRef {
                     key_id: key_id.clone(),
-                    name: format!("<unknown key {}>", key_id.abbreviated()),
+                    name: format!("<unknown key {}>", crypto::abbreviated(key_id)),
                 });
                 continue;
             };

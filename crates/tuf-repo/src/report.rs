@@ -267,7 +267,7 @@ mod tests {
 
     fn signer(name: &str) -> SignerRef {
         SignerRef {
-            key_id: crate::crypto::KeyId::for_pem(
+            key_id: crate::crypto::key_id(
                 "-----BEGIN PUBLIC KEY-----\n\
                  MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEmcIqt4wpIdBCFSZv7EuQkTr7lHjR\n\
                  kyR5EgRkaB5Am9Zc61orKQc9DiOTs5e9d84px3ebGh1NhzMGBUZHiGB1ow==\n\

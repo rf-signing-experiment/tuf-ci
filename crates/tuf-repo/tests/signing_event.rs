@@ -9,7 +9,6 @@
 use std::collections::BTreeMap;
 
 use chrono::{DateTime, TimeZone, Utc};
-use tuf_repo::crypto::KeyId;
 use tuf_repo::event::{ArtifactChange, RoleConfig, SigningEvent};
 use tuf_repo::metadata::{Key, Periods, RoleName};
 use tuf_repo::signer::Signer as _;
@@ -844,7 +843,7 @@ fn a_forged_signature_is_reported_as_invalid_rather_than_counted() {
     let forged = forger.sign(&targets.signing_input()).unwrap();
     let sigs = serde_json::json!({
         "signatures": [{
-            "keyid": alice.key_id().as_str(),
+            "keyid": alice.key_id().to_string(),
             "sig": base64_encode(&forged),
         }],
     });
@@ -894,5 +893,5 @@ fn key_ids_do_not_change_when_a_key_is_annotated() {
     key.owner = Some("@alice-with-a-new-handle".into());
     key.extra
         .insert("x-invented-later".into(), serde_json::json!(true));
-    assert_eq!(KeyId::for_pem(&key.keyval.public).unwrap(), bare_id);
+    assert_eq!(key.derived_key_id().unwrap(), bare_id);
 }
