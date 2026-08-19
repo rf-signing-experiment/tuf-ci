@@ -4,16 +4,18 @@
 //! plugged in: [`crate::testing::MemorySigner`] implements it with a software key, and
 //! `tuf-yubikey` implements it with PIV slot 9c.
 
-use crate::crypto::KeyId;
+use crate::crypto::{KeyId, PublicKey};
 use crate::error::Result;
 
 /// Something that can produce signatures with one key.
 pub trait Signer {
-    /// The PEM-encoded `SubjectPublicKeyInfo` of the key this signer holds.
-    fn public_key_pem(&self) -> &str;
+    /// The public half of the key this signer holds.
+    fn public_key(&self) -> &PublicKey;
 
     /// The id the public key is filed under, derived from the key material.
-    fn key_id(&self) -> &KeyId;
+    fn key_id(&self) -> &KeyId {
+        self.public_key().key_id()
+    }
 
     /// Sign `message`.
     ///
@@ -24,8 +26,8 @@ pub trait Signer {
 }
 
 impl<T: Signer + ?Sized> Signer for Box<T> {
-    fn public_key_pem(&self) -> &str {
-        (**self).public_key_pem()
+    fn public_key(&self) -> &PublicKey {
+        (**self).public_key()
     }
 
     fn key_id(&self) -> &KeyId {

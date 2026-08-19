@@ -22,15 +22,20 @@
 //! Payload and signatures live in separate files so that a diff shows what it should: a
 //! signature commit touches only the `.sig.json` file, and a metadata change is readable
 //! JSON rather than a base64 blob. The two are combined into a
-//! [DSSE](https://github.com/secure-systems-lab/dsse) envelope at publish time; see
-//! [`envelope`].
+//! [DSSE](https://github.com/secure-systems-lab/dsse) envelope at publish time.
+//!
+//! The metadata model itself is the `tuf` crate's: [`tuf::metadata::RootMetadata`] and its
+//! siblings, parsed and written through POUF-2. What this crate adds is the part TUF has
+//! no opinion about — who holds a key, how long a role's word is good for, and how a
+//! change gets from a pull request to a signature. See [`policy`] for the first two and
+//! [`event`] for the last.
 
 #![deny(missing_docs)]
 
 pub mod crypto;
 pub mod error;
 pub mod event;
-pub mod metadata;
+pub mod policy;
 pub mod report;
 pub mod ser;
 pub mod signer;

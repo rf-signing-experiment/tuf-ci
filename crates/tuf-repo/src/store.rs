@@ -4,19 +4,36 @@
 //! [`FsSource`] reads the working tree, and [`GitSource`] reads a commit without checking
 //! it out. That second one is why computing a signing event's status costs nothing: the
 //! "known good" state a signing event is compared against is read straight out of the
-//! merge-base commit, rather than by cloning the repository into a temporary directory as
-//! the Python implementation does on every invocation.
+//! merge-base commit, rather than by cloning the repository into a temporary directory.
+//!
+//! # Documents on disk
+//!
+//! A role is two files. `metadata/root.json` holds the payload — the exact bytes the
+//! signatures cover — and `metadata/root.sig.json` holds the signatures. Keeping them
+//! apart is what makes a signing event reviewable: adding a signature produces a diff
+//! that touches four lines of one file, and a metadata change reads as JSON rather than
+//! as a base64 blob.
+//!
+//! The two are one DSSE envelope, assembled at publish time by concatenation
+//! ([`Signed::envelope`]) and never by re-serializing the payload. POUF-2 signs the
+//! payload's exact bytes, so those bytes are frozen the moment they are authored: any
+//! reformat, however harmless it looks, invalidates every signature already collected.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use dsse::{DsseSignature, SignatureBytes};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use tuf::crypto::{KeyId, PublicKey, Signature, SignatureValue};
+use tuf::metadata::{
+    Delegation, Delegations, Metadata, MetadataPath, RoleDefinition, RootMetadata,
+    SnapshotMetadata, TargetDescription, TargetPath, TargetsMetadata, TimestampMetadata,
+};
+use tuf::pouf::{Pouf, Pouf2};
 
-use crate::crypto;
 use crate::error::{Error, Result};
-use crate::metadata::{Delegator, Payload, RoleName, Root, Snapshot, Targets, Timestamp};
+use crate::policy::{self, Periods, Policy};
 use crate::ser;
 
 /// The directory holding metadata, relative to the repository root.
@@ -28,26 +45,26 @@ pub const TARGETS_DIR: &str = "targets";
 /// The directory holding every published version of the root role.
 pub const ROOT_HISTORY_DIR: &str = "metadata/root_history";
 
-/// The file recording a signing event's open invitations.
+/// The file recording a signing event's open invitations and pending configuration.
 pub const EVENT_STATE_PATH: &str = "metadata/.signing-event.json";
 
 /// The path of a role's payload file.
-pub fn payload_path(role: &RoleName) -> String {
+pub fn payload_path(role: &MetadataPath) -> String {
     format!("{METADATA_DIR}/{role}.json")
 }
 
 /// The path of a role's signature file.
-pub fn signature_path(role: &RoleName) -> String {
+pub fn signature_path(role: &MetadataPath) -> String {
     format!("{METADATA_DIR}/{role}.sig.json")
 }
 
 /// The path of an archived root version's payload file.
-pub fn root_history_payload_path(version: u64) -> String {
+pub fn root_history_payload_path(version: u32) -> String {
     format!("{ROOT_HISTORY_DIR}/{version}.root.json")
 }
 
 /// The path of an archived root version's signature file.
-pub fn root_history_signature_path(version: u64) -> String {
+pub fn root_history_signature_path(version: u32) -> String {
     format!("{ROOT_HISTORY_DIR}/{version}.root.sig.json")
 }
 
@@ -212,20 +229,20 @@ impl Source for EmptySource {
 }
 
 // ---------------------------------------------------------------------------
-// Signed metadata
+// Signed documents
 // ---------------------------------------------------------------------------
 
 /// A metadata payload together with the signatures over it.
 ///
 /// The bytes the payload was read from are kept alongside the parsed value, and signatures
-/// are always checked against *those* bytes. A payload is therefore never re-serialized in
-/// order to verify it, so no amount of drift in how this crate writes JSON can turn a
-/// valid repository into an invalid one.
-#[derive(Clone, Debug, PartialEq)]
-pub struct Signed<P> {
+/// are always checked against *those* bytes. A payload is never re-serialized in order to
+/// verify it, so no drift in how JSON is written can turn a valid repository invalid.
+#[derive(Clone, Debug)]
+pub struct Signed<M> {
     raw: Vec<u8>,
-    payload: P,
-    signatures: Vec<DsseSignature>,
+    payload: M,
+    policy: Policy,
+    signatures: Vec<Signature>,
 }
 
 /// The on-disk shape of a `<role>.sig.json`.
@@ -235,33 +252,71 @@ pub struct Signed<P> {
 #[derive(Default, Serialize, Deserialize)]
 struct SignatureFile {
     #[serde(default)]
-    signatures: Vec<DsseSignature>,
+    signatures: Vec<SignatureEntry>,
 }
 
-impl<P: Payload> Signed<P> {
-    /// Serialize `payload` into a new, unsigned document.
-    pub fn new(payload: P) -> Result<Self> {
-        Ok(Signed {
-            raw: ser::to_bytes(&payload)?,
-            payload,
-            signatures: Vec::new(),
-        })
+/// One signature, as the sidecar records it.
+///
+/// Deliberately not `tuf::crypto::Signature`'s own encoding, which is hex because that is
+/// what POUF-1's canonical JSON calls for. A DSSE envelope writes base64, and the sidecar
+/// is half of an envelope: a signature has to read identically in both files, or a
+/// reviewer comparing them sees two different strings for one signature.
+#[derive(Serialize, Deserialize)]
+struct SignatureEntry {
+    keyid: String,
+    sig: String,
+}
+
+impl SignatureEntry {
+    fn of(signature: &Signature) -> Self {
+        SignatureEntry {
+            keyid: signature.key_id().to_string(),
+            sig: dsse::SignatureBytes::from_bytes(signature.value().as_bytes()).to_base64(),
+        }
+    }
+
+    fn parse(self) -> Result<Signature> {
+        let key_id = self.keyid.parse().map_err(Error::invalid)?;
+        let bytes = dsse::SignatureBytes::from_base64(&self.sig)
+            .map_err(|err| Error::encoding(format!("signature by {}: {err}", self.keyid)))?;
+        Ok(Signature::new(
+            key_id,
+            SignatureValue::new(bytes.into_bytes()),
+        ))
+    }
+}
+
+impl<M: Metadata + ExtraFields + Clone> Signed<M> {
+    /// Author a new, unsigned document.
+    ///
+    /// This is the only place payload bytes are produced. They are pretty-printed once,
+    /// here, and frozen: everything downstream reads [`raw`](Self::raw).
+    pub fn new(payload: M) -> Result<Self> {
+        let raw = ser::author(&payload)?;
+        Self::parse(raw, Vec::new())
     }
 
     /// Parse a payload file and its signature file.
-    pub fn parse(raw: Vec<u8>, signatures: Vec<DsseSignature>) -> Result<Self> {
-        let payload: P = serde_json::from_slice(&raw)?;
-        payload.check_type()?;
+    pub fn parse(raw: Vec<u8>, signatures: Vec<Signature>) -> Result<Self> {
+        let data = <Pouf2 as Pouf>::RawData::from_slice(raw.clone());
+        let payload = M::from_raw_data::<Pouf2>(&data).map_err(Error::invalid)?;
+        let policy = Policy::read(payload.additional_fields_map())?;
         Ok(Signed {
             raw,
             payload,
+            policy,
             signatures,
         })
     }
 
     /// The parsed payload.
-    pub fn payload(&self) -> &P {
+    pub fn payload(&self) -> &M {
         &self.payload
+    }
+
+    /// This project's additions to the payload.
+    pub fn policy(&self) -> &Policy {
+        &self.policy
     }
 
     /// The exact bytes of the payload file.
@@ -270,20 +325,28 @@ impl<P: Payload> Signed<P> {
     }
 
     /// The signatures gathered so far.
-    pub fn signatures(&self) -> &[DsseSignature] {
+    pub fn signatures(&self) -> &[Signature] {
         &self.signatures
     }
 
     /// The bytes of this document's `.sig.json` file.
     pub fn signature_file(&self) -> Result<Vec<u8>> {
         ser::to_bytes(&SignatureFile {
-            signatures: self.signatures.clone(),
+            signatures: self.signatures.iter().map(SignatureEntry::of).collect(),
         })
     }
 
-    /// The bytes that a signature over this payload is computed over.
+    /// The bytes a signature over this payload is computed over.
     pub fn signing_input(&self) -> Vec<u8> {
         dsse::pae(tuf::pouf::PAYLOAD_TYPE, &self.raw)
+    }
+
+    /// The published form: payload and signatures in one DSSE envelope.
+    ///
+    /// Assembled from the stored bytes, never from a fresh serialization of the payload.
+    pub fn envelope(&self) -> Result<Vec<u8>> {
+        let data = <Pouf2 as Pouf>::RawData::from_slice(self.raw.clone());
+        Pouf2::serialize_signed(&self.signatures, &data).map_err(Error::encoding)
     }
 
     /// Replace the payload, discarding every signature.
@@ -291,66 +354,48 @@ impl<P: Payload> Signed<P> {
     /// The signatures are dropped rather than kept because they were made over the old
     /// bytes: keeping them would leave a document whose signatures verify against
     /// something other than what it now says.
-    pub fn set_payload(&mut self, payload: P) -> Result<()> {
-        self.raw = ser::to_bytes(&payload)?;
-        self.payload = payload;
-        self.signatures.clear();
+    pub fn set_payload(&mut self, payload: M) -> Result<()> {
+        *self = Signed::new(payload)?;
         Ok(())
     }
 
-    /// Edit the payload in place, discarding every signature if it changed.
+    /// Record a signature over the current payload bytes, replacing any by the same key.
     ///
-    /// Returns whether the payload ended up different. An edit that changes nothing leaves
-    /// existing signatures alone, so re-running a tool is not a way to lose signatures.
-    pub fn edit(&mut self, edit: impl FnOnce(&mut P)) -> Result<bool> {
-        let mut payload = self.payload.clone();
-        edit(&mut payload);
-        if payload == self.payload {
-            return Ok(false);
-        }
-        self.set_payload(payload)?;
-        Ok(true)
-    }
-
-    /// Record a signature over the current payload bytes, replacing any previous one by
-    /// the same key.
-    ///
-    /// Entries are kept sorted by key id: two signers adding signatures concurrently then
-    /// produce the same file whichever order the commits land in, which keeps merge
-    /// conflicts to the genuine ones.
-    pub fn add_signature(&mut self, key_id: crate::crypto::KeyId, signature: &[u8]) {
+    /// Entries are kept sorted by key id: two signers signing concurrently then produce the
+    /// same file whichever order the commits land in, which keeps merge conflicts to the
+    /// genuine ones.
+    pub fn add_signature(&mut self, signature: Signature) {
         self.signatures
-            .retain(|existing| existing.keyid.as_str() != key_id.as_str());
-        self.signatures.push(DsseSignature::new(
-            SignatureBytes::from_bytes(signature),
-            dsse::KeyId::new(key_id.as_str().to_owned()),
-        ));
-        self.signatures.sort_by(|a, b| a.keyid.cmp(&b.keyid));
+            .retain(|existing| existing.key_id() != signature.key_id());
+        self.signatures.push(signature);
+        self.signatures.sort_by(|a, b| a.key_id().cmp(b.key_id()));
     }
 
     /// Sign the current payload bytes with `signer`.
     pub fn sign_with(&mut self, signer: &mut dyn crate::signer::Signer) -> Result<()> {
-        let signature = signer.sign(&self.signing_input())?;
+        let message = self.signing_input();
+        let bytes = signer.sign(&message)?;
         let key_id = signer.key_id().clone();
 
         // Check our own work before storing it: a signing device that returns a signature
         // over the wrong bytes, or with the wrong key, should be caught here rather than
         // by CI after the signer has gone home.
-        crypto::verify(
-            crypto::KEYTYPE_ECDSA,
-            crypto::ECDSA_SHA2_NISTP256,
-            signer.public_key_pem(),
-            &self.signing_input(),
-            &signature,
-        )
-        .map_err(|_| Error::BadSignature(key_id.clone()))?;
+        signer
+            .public_key()
+            .verify_bytes(&message, &bytes)
+            .map_err(|_| Error::BadSignature(key_id.clone()))?;
 
-        self.add_signature(key_id, &signature);
+        self.add_signature(Signature::new(key_id, SignatureValue::new(bytes)));
         Ok(())
     }
 
     /// Check this document's signatures against what `delegator` says about `role`.
-    pub fn tally(&self, delegator: &Delegator, role: &RoleName) -> Tally {
+    ///
+    /// Deliberately not [`tuf::verify::verify_signatures`], which stops counting the moment
+    /// the threshold is met and logs bad signatures rather than returning them. A pull
+    /// request has to say which named person has signed and which has not, and to tell
+    /// "has not signed" apart from "signed, but the signature does not verify".
+    pub fn tally(&self, delegator: &Delegator<'_>, role: &MetadataPath) -> Tally {
         let Some(spec) = delegator.role_spec(role) else {
             return Tally::empty(role.clone());
         };
@@ -363,27 +408,27 @@ impl<P: Payload> Signed<P> {
             invalid: Vec::new(),
         };
 
-        for key_id in spec.keyids {
+        for key_id in &spec.keyids {
             let Some(key) = delegator.key(key_id) else {
                 // A delegation naming a key the delegator does not hold can never be
                 // satisfied. Report it as an unusable signer rather than ignoring it.
                 tally.invalid.push(SignerRef {
                     key_id: key_id.clone(),
-                    name: format!("<unknown key {}>", crypto::abbreviated(key_id)),
+                    name: format!("<unknown key {}>", crate::crypto::abbreviated(key_id)),
                 });
                 continue;
             };
             let who = SignerRef {
                 key_id: key_id.clone(),
-                name: key.signer_name().to_owned(),
+                name: delegator.signer_name(key_id),
             };
             match self
                 .signatures
                 .iter()
-                .find(|signature| signature.keyid.as_str() == key_id.as_str())
+                .find(|signature| signature.key_id() == key_id)
             {
                 None => tally.missing.push(who),
-                Some(signature) => match key.verify(&message, signature.sig.as_bytes()) {
+                Some(signature) => match key.verify_bytes(&message, signature.value().as_bytes()) {
                     Ok(()) => tally.signed.push(who),
                     Err(_) => tally.invalid.push(who),
                 },
@@ -392,33 +437,507 @@ impl<P: Payload> Signed<P> {
 
         tally
     }
+}
 
-    /// Consume this document, returning its payload.
-    pub fn into_payload(self) -> P {
-        self.payload
+impl<M: PartialEq> PartialEq for Signed<M> {
+    fn eq(&self, other: &Self) -> bool {
+        self.raw == other.raw && self.signatures == other.signatures
     }
 }
 
-impl Signed<Root> {
-    /// This root as a delegator of the top-level roles.
-    pub fn delegator(&self) -> Delegator {
-        Delegator::Root(self.payload.clone())
+impl Signed<RootMetadata> {
+    /// This root seen as the role that delegates to the four top-level roles.
+    pub fn delegator(&self) -> Delegator<'_> {
+        Delegator::Root {
+            root: &self.payload,
+            policy: &self.policy,
+        }
     }
 }
 
-impl Signed<Targets> {
-    /// This targets role as a delegator of the roles it delegates to.
-    pub fn delegator(&self) -> Delegator {
-        Delegator::Targets(self.payload.clone())
+impl Signed<TargetsMetadata> {
+    /// This targets role seen as the role that delegates to the roles it names.
+    pub fn delegator(&self) -> Delegator<'_> {
+        Delegator::Targets {
+            targets: &self.payload,
+            policy: &self.policy,
+        }
     }
 }
 
-/// A key, named the way a person would recognise it.
+/// Reaching a metadata document's extra fields without knowing which kind it is.
+pub trait ExtraFields {
+    /// The fields this crate's model does not name, including the policy block.
+    fn additional_fields_map(&self) -> &HashMap<String, serde_json::Value>;
+}
+
+macro_rules! impl_extra_fields {
+    ($($ty:ty),*) => {
+        $(impl ExtraFields for $ty {
+            fn additional_fields_map(&self) -> &HashMap<String, serde_json::Value> {
+                self.additional_fields()
+            }
+        })*
+    };
+}
+impl_extra_fields!(
+    RootMetadata,
+    TargetsMetadata,
+    SnapshotMetadata,
+    TimestampMetadata
+);
+
+// ---------------------------------------------------------------------------
+// Taking a document apart to change it
+// ---------------------------------------------------------------------------
+//
+// `tuf`'s metadata types are immutable by construction, which is right for a document that
+// has been signed and wrong for one being drafted. These are the seam: take a document
+// apart, change a field, put it back together. They exist only for the duration of an
+// edit — every field is `tuf`'s own type, and nothing here is a parallel model.
+
+/// The pieces of a [`RootMetadata`].
+#[derive(Clone, Debug)]
+pub struct RootParts {
+    /// The metadata version.
+    pub version: u32,
+    /// When this metadata stops being valid.
+    pub expires: DateTime<Utc>,
+    /// Whether published metadata is version- and hash-prefixed.
+    pub consistent_snapshot: bool,
+    /// Every key referenced by [`roles`](Self::roles).
+    pub keys: HashMap<KeyId, PublicKey>,
+    /// The four top-level roles.
+    pub roles: BTreeMap<String, RoleParts>,
+    /// This project's additions.
+    pub policy: Policy,
+    /// Fields nothing here names.
+    pub extra: HashMap<String, serde_json::Value>,
+}
+
+/// Who may sign one role, and how many of them are needed.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RoleParts {
+    /// The keys permitted to sign.
+    pub keyids: BTreeSet<KeyId>,
+    /// How many distinct keys must sign.
+    pub threshold: u32,
+}
+
+impl RootParts {
+    /// Take `root` apart.
+    pub fn of(root: &RootMetadata, policy: &Policy) -> Self {
+        RootParts {
+            version: root.version(),
+            expires: *root.expires(),
+            consistent_snapshot: root.consistent_snapshot(),
+            keys: root.keys().clone(),
+            roles: BTreeMap::from([
+                ("root".to_owned(), role_parts(root.root())),
+                ("snapshot".to_owned(), role_parts(root.snapshot())),
+                ("targets".to_owned(), role_parts(root.targets())),
+                ("timestamp".to_owned(), role_parts(root.timestamp())),
+            ]),
+            policy: policy.clone(),
+            extra: root.additional_fields().clone(),
+        }
+    }
+
+    /// An empty root delegating to the four top-level roles, but to no keys yet.
+    pub fn empty(now: DateTime<Utc>, periods: Periods) -> Self {
+        let mut policy = Policy::default();
+        let mut roles = BTreeMap::new();
+        for name in ["root", "snapshot", "targets", "timestamp"] {
+            roles.insert(
+                name.to_owned(),
+                RoleParts {
+                    keyids: BTreeSet::new(),
+                    threshold: 1,
+                },
+            );
+            policy.periods.insert(name.to_owned(), periods);
+        }
+        RootParts {
+            version: 1,
+            expires: periods.expires_at(now),
+            consistent_snapshot: true,
+            keys: HashMap::new(),
+            roles,
+            policy,
+            extra: HashMap::new(),
+        }
+    }
+
+    /// The entry for `role`, which must be one of the four top-level roles.
+    pub fn role_mut(&mut self, role: &MetadataPath) -> Result<&mut RoleParts> {
+        self.roles
+            .get_mut(role.as_str())
+            .ok_or_else(|| Error::NoSuchRole(role.to_string()))
+    }
+
+    /// Put the document back together.
+    ///
+    /// Drops keys no role refers to any more, and the policy recorded about them: a key
+    /// left behind after the last role that could use it stopped naming it reads as a key
+    /// the repository still trusts.
+    pub fn build(mut self) -> Result<RootMetadata> {
+        let in_use: BTreeSet<&KeyId> = self.roles.values().flat_map(|r| &r.keyids).collect();
+        let live: Vec<KeyId> = in_use.iter().map(|id| (*id).clone()).collect();
+        self.keys.retain(|key_id, _| in_use.contains(key_id));
+        self.policy.retain_keys(live.iter());
+        self.policy.write(&mut self.extra)?;
+
+        RootMetadata::new(
+            self.version,
+            self.expires,
+            self.consistent_snapshot,
+            self.keys.clone(),
+            role_definition(&self.roles, "root")?,
+            role_definition(&self.roles, "snapshot")?,
+            role_definition(&self.roles, "targets")?,
+            role_definition(&self.roles, "timestamp")?,
+            self.extra.clone(),
+        )
+        .map_err(Error::invalid)
+    }
+}
+
+/// Take one role definition apart, whichever role it happens to describe.
+fn role_parts<M: Metadata>(definition: &RoleDefinition<M>) -> RoleParts {
+    RoleParts {
+        keyids: definition.key_ids().iter().cloned().collect(),
+        threshold: definition.threshold(),
+    }
+}
+
+/// Put one role definition back together.
+fn role_definition<M: Metadata>(
+    roles: &BTreeMap<String, RoleParts>,
+    name: &str,
+) -> Result<RoleDefinition<M>> {
+    let parts = roles
+        .get(name)
+        .ok_or_else(|| Error::NoSuchRole(name.to_owned()))?;
+    RoleDefinition::new(parts.threshold, parts.keyids.iter().cloned().collect())
+        .map_err(Error::invalid)
+}
+
+/// The pieces of a [`TargetsMetadata`].
+#[derive(Clone, Debug)]
+pub struct TargetsParts {
+    /// The metadata version.
+    pub version: u32,
+    /// When this metadata stops being valid.
+    pub expires: DateTime<Utc>,
+    /// The artifacts this role vouches for.
+    pub targets: HashMap<TargetPath, TargetDescription>,
+    /// Every key referenced by [`roles`](Self::roles).
+    pub keys: HashMap<KeyId, PublicKey>,
+    /// The roles this one delegates to, in the order they are searched.
+    pub roles: Vec<DelegationParts>,
+    /// This project's additions.
+    pub policy: Policy,
+    /// Fields nothing here names.
+    pub extra: HashMap<String, serde_json::Value>,
+}
+
+/// The pieces of one [`Delegation`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DelegationParts {
+    /// The delegated role's name.
+    pub name: MetadataPath,
+    /// The keys permitted to sign it.
+    pub keyids: BTreeSet<KeyId>,
+    /// How many distinct keys must sign.
+    pub threshold: u32,
+    /// Artifact path patterns the role is responsible for.
+    pub paths: BTreeSet<String>,
+    /// Whether a match here ends the delegation search.
+    pub terminating: bool,
+}
+
+impl TargetsParts {
+    /// Take `targets` apart.
+    pub fn of(targets: &TargetsMetadata, policy: &Policy) -> Self {
+        TargetsParts {
+            version: targets.version(),
+            expires: *targets.expires(),
+            targets: targets.targets().clone(),
+            keys: targets.delegations().keys().clone(),
+            roles: targets
+                .delegations()
+                .roles()
+                .iter()
+                .map(|delegation| DelegationParts {
+                    name: delegation.name().clone(),
+                    keyids: delegation.key_ids().iter().cloned().collect(),
+                    threshold: delegation.threshold(),
+                    paths: delegation
+                        .paths()
+                        .iter()
+                        .map(|path| path.to_string())
+                        .collect(),
+                    terminating: delegation.terminating(),
+                })
+                .collect(),
+            policy: policy.clone(),
+            extra: targets.additional_fields().clone(),
+        }
+    }
+
+    /// An empty targets role, vouching for nothing and delegating to nobody.
+    pub fn empty(now: DateTime<Utc>, periods: Periods) -> Self {
+        TargetsParts {
+            version: 1,
+            expires: periods.expires_at(now),
+            targets: HashMap::new(),
+            keys: HashMap::new(),
+            roles: Vec::new(),
+            policy: Policy::default(),
+            extra: HashMap::new(),
+        }
+    }
+
+    /// The delegation to `role`, creating it with default paths if it is new.
+    pub fn delegation_mut(&mut self, role: &MetadataPath) -> &mut DelegationParts {
+        if let Some(index) = self.roles.iter().position(|d| &d.name == role) {
+            return &mut self.roles[index];
+        }
+        self.roles.push(DelegationParts {
+            name: role.clone(),
+            keyids: BTreeSet::new(),
+            threshold: 1,
+            paths: policy::default_paths(role).into_iter().collect(),
+            terminating: true,
+        });
+        // Ordered by name so that adding one produces a diff showing only that delegation,
+        // whatever order events happen to be merged in.
+        self.roles.sort_by(|a, b| a.name.cmp(&b.name));
+        self.roles
+            .iter_mut()
+            .find(|d| &d.name == role)
+            .expect("just inserted")
+    }
+
+    /// Remove the delegation to `role`. Returns whether there was one.
+    pub fn remove_delegation(&mut self, role: &MetadataPath) -> bool {
+        let before = self.roles.len();
+        self.roles.retain(|d| &d.name != role);
+        self.policy.periods.remove(role.as_str());
+        before != self.roles.len()
+    }
+
+    /// Put the document back together.
+    pub fn build(mut self) -> Result<TargetsMetadata> {
+        let in_use: BTreeSet<&KeyId> = self.roles.iter().flat_map(|r| &r.keyids).collect();
+        let live: Vec<KeyId> = in_use.iter().map(|id| (*id).clone()).collect();
+        self.keys.retain(|key_id, _| in_use.contains(key_id));
+        self.policy.retain_keys(live.iter());
+        self.policy.write(&mut self.extra)?;
+
+        let mut roles = Vec::with_capacity(self.roles.len());
+        for parts in &self.roles {
+            let paths: HashSet<TargetPath> = parts
+                .paths
+                .iter()
+                .map(|path| TargetPath::new(path.clone()).map_err(Error::invalid))
+                .collect::<Result<_>>()?;
+            roles.push(
+                Delegation::new(
+                    parts.name.clone(),
+                    parts.terminating,
+                    parts.threshold,
+                    parts.keyids.iter().cloned().collect(),
+                    paths,
+                )
+                .map_err(Error::invalid)?,
+            );
+        }
+
+        let delegations = Delegations::new(self.keys.clone(), roles).map_err(Error::invalid)?;
+        TargetsMetadata::new(
+            self.version,
+            self.expires,
+            self.targets.clone(),
+            delegations,
+            self.extra.clone(),
+        )
+        .map_err(Error::invalid)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Delegators
+// ---------------------------------------------------------------------------
+
+/// A role that defines the keys and threshold of other roles.
+///
+/// `root` delegates to the four top-level roles; a targets role delegates to the roles in
+/// its `delegations`. Both answer the same two questions, so the signing-event logic can
+/// treat them alike.
+#[derive(Clone, Copy, Debug)]
+pub enum Delegator<'a> {
+    /// The root role, delegating to the top-level roles.
+    Root {
+        /// The root payload.
+        root: &'a RootMetadata,
+        /// Its policy block.
+        policy: &'a Policy,
+    },
+    /// A targets role, delegating to the roles named in its delegations.
+    Targets {
+        /// The targets payload.
+        targets: &'a TargetsMetadata,
+        /// Its policy block.
+        policy: &'a Policy,
+    },
+}
+
+/// What a delegator says about one of its delegates.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RoleSpec {
+    /// The keys permitted to sign, ordered so reports are stable.
+    pub keyids: Vec<KeyId>,
+    /// How many distinct keys must sign.
+    pub threshold: u32,
+    /// Validity and re-signing periods.
+    pub periods: Periods,
+}
+
+impl<'a> Delegator<'a> {
+    /// This delegator's policy block.
+    pub fn policy(&self) -> &'a Policy {
+        match self {
+            Delegator::Root { policy, .. } | Delegator::Targets { policy, .. } => policy,
+        }
+    }
+
+    /// What this role says about its delegate `role`, if it delegates to it at all.
+    pub fn role_spec(&self, role: &MetadataPath) -> Option<RoleSpec> {
+        let (keyids, threshold) = match self {
+            Delegator::Root { root, .. } => {
+                let definition = match role.as_str() {
+                    "root" => root.root(),
+                    "snapshot" => return spec_of(root.snapshot(), role, self.policy()),
+                    "targets" => return spec_of(root.targets(), role, self.policy()),
+                    "timestamp" => return spec_of(root.timestamp(), role, self.policy()),
+                    _ => return None,
+                };
+                (definition.key_ids().clone(), definition.threshold())
+            }
+            Delegator::Targets { targets, .. } => {
+                let delegation = targets
+                    .delegations()
+                    .roles()
+                    .iter()
+                    .find(|delegation| delegation.name() == role)?;
+                (delegation.key_ids().clone(), delegation.threshold())
+            }
+        };
+        let mut keyids: Vec<KeyId> = keyids.into_iter().collect();
+        keyids.sort();
+        Some(RoleSpec {
+            keyids,
+            threshold,
+            periods: self.policy().periods(role),
+        })
+    }
+
+    /// Look up one of this role's keys.
+    pub fn key(&self, key_id: &KeyId) -> Option<&'a PublicKey> {
+        match self {
+            Delegator::Root { root, .. } => root.keys().get(key_id),
+            Delegator::Targets { targets, .. } => targets.delegations().keys().get(key_id),
+        }
+    }
+
+    /// Every key this role holds.
+    pub fn keys(&self) -> &'a HashMap<KeyId, PublicKey> {
+        match self {
+            Delegator::Root { root, .. } => root.keys(),
+            Delegator::Targets { targets, .. } => targets.delegations().keys(),
+        }
+    }
+
+    /// Who or what signs with `key_id`, named the way a person would recognise it.
+    pub fn signer_name(&self, key_id: &KeyId) -> String {
+        self.policy().signer_name(key_id)
+    }
+
+    /// The keys permitted to sign `role`, in the order the delegation lists them.
+    ///
+    /// Key ids naming a key this delegator does not hold are skipped; such a delegation is
+    /// unsatisfiable, which [`crate::event`] reports separately rather than by panicking.
+    pub fn keys_for(&self, role: &MetadataPath) -> Vec<(KeyId, &'a PublicKey)> {
+        let Some(spec) = self.role_spec(role) else {
+            return Vec::new();
+        };
+        spec.keyids
+            .into_iter()
+            .filter_map(|key_id| self.key(&key_id).map(|key| (key_id, key)))
+            .collect()
+    }
+
+    /// The names of every role this one delegates to.
+    pub fn delegated_roles(&self) -> Vec<MetadataPath> {
+        match self {
+            Delegator::Root { .. } => vec![
+                MetadataPath::root(),
+                MetadataPath::snapshot(),
+                MetadataPath::targets(),
+                MetadataPath::timestamp(),
+            ],
+            Delegator::Targets { targets, .. } => targets
+                .delegations()
+                .roles()
+                .iter()
+                .map(|delegation| delegation.name().clone())
+                .collect(),
+        }
+    }
+
+    /// The artifact path patterns `role` is responsible for.
+    pub fn paths_for(&self, role: &MetadataPath) -> Vec<String> {
+        match self {
+            Delegator::Root { .. } => Vec::new(),
+            Delegator::Targets { targets, .. } => targets
+                .delegations()
+                .roles()
+                .iter()
+                .find(|delegation| delegation.name() == role)
+                .map(|delegation| delegation.paths().iter().map(|p| p.to_string()).collect())
+                .unwrap_or_default(),
+        }
+    }
+}
+
+fn spec_of<M>(
+    definition: &RoleDefinition<M>,
+    role: &MetadataPath,
+    policy: &Policy,
+) -> Option<RoleSpec>
+where
+    M: Metadata,
+{
+    let mut keyids: Vec<KeyId> = definition.key_ids().iter().cloned().collect();
+    keyids.sort();
+    Some(RoleSpec {
+        keyids,
+        threshold: definition.threshold(),
+        periods: policy.periods(role),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Signature tallies
+// ---------------------------------------------------------------------------
+
+/// One key, named the way a person would recognise it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SignerRef {
-    /// The key's id.
-    pub key_id: crate::crypto::KeyId,
-    /// The signer's `@handle`, or an online signer's URI.
+    /// The key.
+    pub key_id: KeyId,
+    /// Who holds it.
     pub name: String,
 }
 
@@ -426,7 +945,7 @@ pub struct SignerRef {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Tally {
     /// The role the signatures are for.
-    pub role: RoleName,
+    pub role: MetadataPath,
     /// How many valid signatures are required.
     pub threshold: u32,
     /// Keys that have signed the current payload.
@@ -439,10 +958,7 @@ pub struct Tally {
 
 impl Tally {
     /// A tally with nobody permitted to sign, which can never be satisfied.
-    ///
-    /// This is what a role nothing delegates to looks like, and what a role reports while
-    /// its delegating metadata is missing.
-    pub fn empty(role: RoleName) -> Self {
+    pub fn empty(role: MetadataPath) -> Self {
         Tally {
             role,
             // An unreachable threshold: nobody is permitted to sign this role, so no
@@ -469,45 +985,59 @@ impl Tally {
 // Signing event state
 // ---------------------------------------------------------------------------
 
-/// The contents of `metadata/.signing-event.json`.
+/// The unsigned state of a signing event: what is intended but not yet in the metadata.
 ///
-/// An invitation records that somebody has been added as a signer of a role but has not
-/// yet contributed a key. The file exists only while an event has open invitations; the
-/// last accepted invitation removes it.
+/// Two things live here rather than in the metadata, for the same reason. A signer who has
+/// been invited has no key in the repository yet, and a role whose threshold is being
+/// raised cannot have that threshold written until the keys to meet it exist — TUF
+/// metadata naming a threshold it has no keys for is not valid metadata, and every tool
+/// that reads it, including this one, is entitled to reject it.
+///
+/// So intent is recorded here and materialised into the metadata the moment it can be
+/// satisfied. The file is deleted when the event closes.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Invites {
+pub struct EventState {
     /// Roles each invited signer has yet to accept, keyed by `@handle`.
-    #[serde(default)]
-    pub invites: BTreeMap<String, Vec<RoleName>>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub invites: BTreeMap<String, Vec<MetadataPath>>,
+    /// Role configurations that cannot be written until every signer has a key.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub pending: BTreeMap<String, crate::policy::RoleConfig>,
 }
 
-impl Invites {
-    /// No open invitations.
+impl EventState {
+    /// An event with nothing outstanding.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Whether there are no open invitations at all.
+    /// Whether there is nothing outstanding, so the file can be removed.
     pub fn is_empty(&self) -> bool {
-        self.invites.is_empty()
+        self.invites.is_empty() && self.pending.is_empty()
     }
 
     /// The roles `user` has been invited to.
-    pub fn for_user(&self, user: &str) -> &[RoleName] {
-        self.invites.get(user).map_or(&[], Vec::as_slice)
+    pub fn for_user(&self, user: &str) -> &[MetadataPath] {
+        self.invites
+            .get(user)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
     }
 
-    /// The users invited to `role`.
-    pub fn for_role(&self, role: &RoleName) -> Vec<&str> {
-        self.invites
+    /// Everyone invited to `role`.
+    pub fn for_role(&self, role: &MetadataPath) -> Vec<&str> {
+        let mut users: Vec<&str> = self
+            .invites
             .iter()
             .filter(|(_, roles)| roles.contains(role))
             .map(|(user, _)| user.as_str())
-            .collect()
+            .collect();
+        users.sort_unstable();
+        users
     }
 
     /// Invite `user` to sign `role`.
-    pub fn add(&mut self, user: &str, role: &RoleName) {
+    pub fn add(&mut self, user: &str, role: &MetadataPath) {
         let roles = self.invites.entry(user.to_owned()).or_default();
         if !roles.contains(role) {
             roles.push(role.clone());
@@ -515,42 +1045,48 @@ impl Invites {
         }
     }
 
-    /// Withdraw `user`'s invitation to `role`.
-    pub fn remove(&mut self, user: &str, role: &RoleName) {
+    /// Withdraw one invitation, dropping the signer once nothing is outstanding.
+    pub fn remove(&mut self, user: &str, role: &MetadataPath) {
         if let Some(roles) = self.invites.get_mut(user) {
-            roles.retain(|invited| invited != role);
+            roles.retain(|open| open != role);
             if roles.is_empty() {
                 self.invites.remove(user);
             }
         }
     }
 
-    /// Withdraw every invitation to `role`, whoever holds it.
-    pub fn remove_role(&mut self, role: &RoleName) {
+    /// Withdraw every invitation to `role`.
+    pub fn remove_role(&mut self, role: &MetadataPath) {
         for roles in self.invites.values_mut() {
-            roles.retain(|invited| invited != role);
+            roles.retain(|open| open != role);
         }
         self.invites.retain(|_, roles| !roles.is_empty());
+        self.pending.remove(role.as_str());
+    }
+
+    /// The configuration `role` is waiting to have written, if any.
+    pub fn pending_for(&self, role: &MetadataPath) -> Option<&crate::policy::RoleConfig> {
+        self.pending.get(role.as_str())
     }
 }
 
 // ---------------------------------------------------------------------------
-// Loading a whole repository
+// Repository state
 // ---------------------------------------------------------------------------
 
-/// Every role in a repository at one point in time.
-#[derive(Clone, Debug, Default)]
+/// Every metadata document in a repository at one point in time.
+#[derive(Debug, Default)]
 pub struct RepoState {
     /// The root role, absent before the repository has been created.
-    pub root: Option<Signed<Root>>,
+    pub root: Option<Signed<RootMetadata>>,
     /// The top-level targets role and every delegated targets role.
-    pub targets: BTreeMap<RoleName, Signed<Targets>>,
+    pub targets: BTreeMap<MetadataPath, Signed<TargetsMetadata>>,
     /// The snapshot role, which only online signing produces.
-    pub snapshot: Option<Signed<Snapshot>>,
+    pub snapshot: Option<Signed<SnapshotMetadata>>,
     /// The timestamp role, which only online signing produces.
-    pub timestamp: Option<Signed<Timestamp>>,
-    /// Open invitations, if this state is mid-signing-event.
-    pub invites: Invites,
+    pub timestamp: Option<Signed<TimestampMetadata>>,
+    /// Invitations and pending configuration, if this state is mid-signing-event.
+    pub event: EventState,
 }
 
 impl RepoState {
@@ -567,11 +1103,11 @@ impl RepoState {
             };
             let signatures = read_signatures(source, &role)?;
 
-            if role == RoleName::root() {
+            if role == MetadataPath::root() {
                 state.root = Some(Signed::parse(raw, signatures)?);
-            } else if role == RoleName::snapshot() {
+            } else if role == MetadataPath::snapshot() {
                 state.snapshot = Some(Signed::parse(raw, signatures)?);
-            } else if role == RoleName::timestamp() {
+            } else if role == MetadataPath::timestamp() {
                 state.timestamp = Some(Signed::parse(raw, signatures)?);
             } else {
                 state.targets.insert(role, Signed::parse(raw, signatures)?);
@@ -579,7 +1115,7 @@ impl RepoState {
         }
 
         if let Some(raw) = source.read(EVENT_STATE_PATH)? {
-            state.invites = serde_json::from_slice(&raw)?;
+            state.event = serde_json::from_slice(&raw)?;
         }
 
         Ok(state)
@@ -591,7 +1127,7 @@ impl RepoState {
     }
 
     /// The root role, or an error naming what is missing.
-    pub fn root(&self) -> Result<&Signed<Root>> {
+    pub fn root(&self) -> Result<&Signed<RootMetadata>> {
         self.root
             .as_ref()
             .ok_or_else(|| Error::invalid("this repository has no root metadata yet"))
@@ -599,38 +1135,61 @@ impl RepoState {
 
     /// The role that defines the keys and threshold of `role`.
     ///
-    /// Top-level roles are delegated by root; everything else by the top-level targets
-    /// role.
-    pub fn delegator_of(&self, role: &RoleName) -> Result<Delegator> {
-        if role.is_top_level() {
+    /// Top-level roles are delegated by root; everything else by the top-level targets role.
+    pub fn delegator_of(&self, role: &MetadataPath) -> Result<Delegator<'_>> {
+        if policy::is_top_level(role) {
             Ok(self.root()?.delegator())
         } else {
             self.targets
-                .get(&RoleName::targets())
-                .map(Signed::<Targets>::delegator)
-                .ok_or_else(|| Error::NoSuchRole(RoleName::targets().to_string()))
+                .get(&MetadataPath::targets())
+                .map(Signed::<TargetsMetadata>::delegator)
+                .ok_or_else(|| Error::NoSuchRole(MetadataPath::targets().to_string()))
         }
+    }
+
+    /// `role` seen as a delegator of other roles, if it is one.
+    pub fn delegator_view(&self, role: &MetadataPath) -> Option<Delegator<'_>> {
+        if *role == MetadataPath::root() {
+            return self.root.as_ref().map(Signed::<RootMetadata>::delegator);
+        }
+        self.targets
+            .get(role)
+            .map(Signed::<TargetsMetadata>::delegator)
     }
 
     /// Every role present, ordered `root`, `targets`, then delegates alphabetically.
     ///
     /// The order matters wherever roles are reported or processed in turn: a delegating
     /// role has to be dealt with before the roles it delegates to.
-    pub fn role_names(&self) -> Vec<RoleName> {
+    pub fn role_names(&self) -> Vec<MetadataPath> {
         let mut names = Vec::new();
         if self.root.is_some() {
-            names.push(RoleName::root());
+            names.push(MetadataPath::root());
         }
-        if self.targets.contains_key(&RoleName::targets()) {
-            names.push(RoleName::targets());
+        if self.targets.contains_key(&MetadataPath::targets()) {
+            names.push(MetadataPath::targets());
         }
         names.extend(
             self.targets
                 .keys()
-                .filter(|role| **role != RoleName::targets())
+                .filter(|role| **role != MetadataPath::targets())
                 .cloned(),
         );
         names
+    }
+
+    /// The exact payload bytes of `role`, if it is present.
+    pub fn raw_payload(&self, role: &MetadataPath) -> Option<&[u8]> {
+        if *role == MetadataPath::root() {
+            return self.root.as_ref().map(Signed::raw);
+        }
+        if *role == MetadataPath::snapshot() {
+            return self.snapshot.as_ref().map(Signed::raw);
+        }
+        if *role == MetadataPath::timestamp() {
+            return self.timestamp.as_ref().map(Signed::raw);
+        }
+        self.targets.get(role).map(Signed::raw)
     }
 
     /// The version of `role`, or zero if it does not exist here.
@@ -638,18 +1197,18 @@ impl RepoState {
     /// Zero for an absent role is what makes "one more than the known-good version" the
     /// right rule for a role being created for the first time as well as for one being
     /// changed.
-    pub fn version_of(&self, role: &RoleName) -> u64 {
-        if *role == RoleName::root() {
-            return self.root.as_ref().map_or(0, |r| r.payload().version);
+    pub fn version_of(&self, role: &MetadataPath) -> u32 {
+        if *role == MetadataPath::root() {
+            return self.root.as_ref().map_or(0, |r| r.payload().version());
         }
-        self.targets.get(role).map_or(0, |t| t.payload().version)
+        self.targets.get(role).map_or(0, |t| t.payload().version())
     }
 }
 
 /// The role a metadata path belongs to, or `None` if it is not a role payload.
 ///
 /// Signature files, the event state file and archived roots all read as `None`.
-fn role_of_metadata_path(path: &str) -> Option<RoleName> {
+fn role_of_metadata_path(path: &str) -> Option<MetadataPath> {
     let name = path.strip_prefix(METADATA_DIR)?.strip_prefix('/')?;
     // Anything in a subdirectory is history, not current state.
     if name.contains('/') {
@@ -659,12 +1218,16 @@ fn role_of_metadata_path(path: &str) -> Option<RoleName> {
     if stem.ends_with(".sig") || stem.starts_with('.') {
         return None;
     }
-    stem.parse().ok()
+    policy::role_name(stem).ok()
 }
 
-fn read_signatures(source: &dyn Source, role: &RoleName) -> Result<Vec<DsseSignature>> {
+fn read_signatures(source: &dyn Source, role: &MetadataPath) -> Result<Vec<Signature>> {
     match source.read(&signature_path(role))? {
-        Some(raw) => Ok(serde_json::from_slice::<SignatureFile>(&raw)?.signatures),
+        Some(raw) => serde_json::from_slice::<SignatureFile>(&raw)?
+            .signatures
+            .into_iter()
+            .map(SignatureEntry::parse)
+            .collect(),
         None => Ok(Vec::new()),
     }
 }
@@ -686,32 +1249,34 @@ impl Writer {
     }
 
     /// Write a role's payload and signature files.
-    ///
-    /// Writing root also archives that version under `root_history/`, so that a client
-    /// that trusts an old root can walk forward to the current one.
-    pub fn write_role<P: Payload>(&self, role: &RoleName, signed: &Signed<P>) -> Result<()> {
+    pub fn write_role<M: Metadata + ExtraFields + Clone>(
+        &self,
+        role: &MetadataPath,
+        signed: &Signed<M>,
+    ) -> Result<()> {
         self.write(&payload_path(role), signed.raw())?;
-        self.write(&signature_path(role), &signed.signature_file()?)?;
-
-        if *role == RoleName::root() {
-            let version = signed.payload().version();
-            self.write(&root_history_payload_path(version), signed.raw())?;
-            self.write(
-                &root_history_signature_path(version),
-                &signed.signature_file()?,
-            )?;
-        }
-        Ok(())
+        self.write(&signature_path(role), &signed.signature_file()?)
     }
 
-    /// Write the signing event state, removing the file when no invitations are open.
+    /// Archive a root version under `root_history/`, so that a client trusting an old root
+    /// can walk forward to the current one.
+    pub fn archive_root(&self, signed: &Signed<RootMetadata>) -> Result<()> {
+        let version = signed.payload().version();
+        self.write(&root_history_payload_path(version), signed.raw())?;
+        self.write(
+            &root_history_signature_path(version),
+            &signed.signature_file()?,
+        )
+    }
+
+    /// Write the signing event state, removing the file when nothing is outstanding.
     ///
     /// Returns whether the path is worth staging: writing it obviously is, and so is
     /// removing one that existed, but a file that was never there and still is not would
     /// make `git add` fail on a path it has never heard of.
-    pub fn write_invites(&self, invites: &Invites) -> Result<bool> {
-        if !invites.is_empty() {
-            self.write(EVENT_STATE_PATH, &ser::to_bytes(invites)?)?;
+    pub fn write_event_state(&self, state: &EventState) -> Result<bool> {
+        if !state.is_empty() {
+            self.write(EVENT_STATE_PATH, &ser::to_bytes(state)?)?;
             return Ok(true);
         }
         self.remove(EVENT_STATE_PATH)
@@ -720,7 +1285,7 @@ impl Writer {
     /// Delete a role's payload and signature files.
     ///
     /// Returns whether anything was actually there to delete.
-    pub fn remove_role(&self, role: &RoleName) -> Result<bool> {
+    pub fn remove_role(&self, role: &MetadataPath) -> Result<bool> {
         let mut removed = false;
         for path in [payload_path(role), signature_path(role)] {
             removed |= self.remove(&path)?;
@@ -764,6 +1329,46 @@ mod tests {
     }
 
     #[test]
+    fn event_state_round_trips_through_its_file() {
+        let mut state = EventState::new();
+        state.add("@arlosi", &MetadataPath::root());
+        state.add("@arlosi", &MetadataPath::targets());
+        state.add("@other", &MetadataPath::root());
+
+        let bytes = ser::to_bytes(&state).unwrap();
+        let parsed: EventState = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(parsed, state);
+
+        assert_eq!(parsed.for_user("@arlosi").len(), 2);
+        assert_eq!(
+            parsed.for_role(&MetadataPath::root()),
+            ["@arlosi", "@other"]
+        );
+        assert!(parsed.for_user("@nobody").is_empty());
+    }
+
+    #[test]
+    fn accepting_the_last_invitation_empties_the_state() {
+        let mut state = EventState::new();
+        state.add("@arlosi", &MetadataPath::root());
+        state.remove("@arlosi", &MetadataPath::root());
+        assert!(state.is_empty());
+    }
+
+    #[test]
+    fn removing_a_role_withdraws_every_invitation_to_it() {
+        let crates = policy::role_name("crates").unwrap();
+        let mut state = EventState::new();
+        state.add("@arlosi", &crates);
+        state.add("@other", &crates);
+        state.add("@other", &MetadataPath::root());
+        state.remove_role(&crates);
+        assert_eq!(state.for_role(&crates), Vec::<&str>::new());
+        assert_eq!(state.for_user("@other"), [MetadataPath::root()]);
+        assert!(state.for_user("@arlosi").is_empty());
+    }
+
+    #[test]
     fn the_signature_file_format_is_fixed() {
         // A real key id and signature, in the layout this crate writes. Nothing verifies
         // against these bytes — signatures cover the payload file — but a change in field
@@ -772,8 +1377,8 @@ mod tests {
         const FILE: &str = r#"{
   "signatures": [
     {
-      "sig": "MEUCIQDh632FEh1JHYqSMGJgdH/djiDyv31xT1bYgPyPBsF0IwIgXas0UGf023NZKEgyy3y4JPVhzq8Ed0x/yeraHtnV3FU=",
-      "keyid": "bd828d85ebaa1d4a1e59773e5056d384b87f98db8604b77f76af056d36b8e6f9"
+      "keyid": "bd828d85ebaa1d4a1e59773e5056d384b87f98db8604b77f76af056d36b8e6f9",
+      "sig": "MEUCIQDh632FEh1JHYqSMGJgdH/djiDyv31xT1bYgPyPBsF0IwIgXas0UGf023NZKEgyy3y4JPVhzq8Ed0x/yeraHtnV3FU="
     }
   ]
 }
@@ -781,80 +1386,5 @@ mod tests {
 
         let parsed: SignatureFile = serde_json::from_slice(FILE.as_bytes()).unwrap();
         assert_eq!(ser::to_bytes(&parsed).unwrap(), FILE.as_bytes());
-    }
-
-    #[test]
-    fn signatures_are_ordered_and_replaced_rather_than_duplicated() {
-        use crate::crypto::KeyId;
-        use std::str::FromStr;
-
-        let key = |s: &str| KeyId::from_str(s).unwrap();
-        let root = || {
-            Root::empty(
-                chrono::Utc::now(),
-                crate::metadata::Periods {
-                    expiry_days: 365,
-                    signing_days: 60,
-                },
-            )
-        };
-        let signatures = |doc: &Signed<Root>| -> Vec<String> {
-            doc.signatures()
-                .iter()
-                .map(|s| format!("{}:{}", s.keyid, s.sig))
-                .collect()
-        };
-
-        // Two signers, signing in either order, must produce the same file: whichever
-        // commit lands second should merge, not conflict.
-        let mut forwards = Signed::new(root()).unwrap();
-        forwards.add_signature(key("aaa"), b"1");
-        forwards.add_signature(key("bbb"), b"2");
-
-        let mut backwards = Signed::new(root()).unwrap();
-        backwards.add_signature(key("bbb"), b"2");
-        backwards.add_signature(key("aaa"), b"1");
-
-        assert_eq!(signatures(&forwards), signatures(&backwards));
-
-        // Signing again replaces: a role must never appear to have met its threshold on
-        // the strength of one key signing twice.
-        backwards.add_signature(key("aaa"), b"again");
-        assert_eq!(backwards.signatures().len(), 2);
-    }
-
-    #[test]
-    fn invites_round_trip_through_their_file() {
-        let mut invites = Invites::new();
-        invites.add("@arlosi", &RoleName::root());
-        invites.add("@arlosi", &RoleName::targets());
-        invites.add("@other", &RoleName::root());
-
-        let bytes = ser::to_bytes(&invites).unwrap();
-        let parsed: Invites = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(parsed, invites);
-
-        assert_eq!(parsed.for_user("@arlosi").len(), 2);
-        assert_eq!(parsed.for_role(&RoleName::root()), ["@arlosi", "@other"]);
-        assert!(parsed.for_user("@nobody").is_empty());
-    }
-
-    #[test]
-    fn accepting_the_last_invitation_empties_the_state() {
-        let mut invites = Invites::new();
-        invites.add("@arlosi", &RoleName::root());
-        invites.remove("@arlosi", &RoleName::root());
-        assert!(invites.is_empty());
-    }
-
-    #[test]
-    fn removing_a_role_withdraws_every_invitation_to_it() {
-        let mut invites = Invites::new();
-        invites.add("@a", &RoleName::root());
-        invites.add("@b", &RoleName::root());
-        invites.add("@b", &RoleName::targets());
-        invites.remove_role(&RoleName::root());
-        assert_eq!(invites.for_user("@b"), [RoleName::targets()]);
-        assert!(invites.for_user("@a").is_empty());
     }
 }

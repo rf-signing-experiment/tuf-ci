@@ -8,7 +8,7 @@
 use anyhow::{Context, Result, bail};
 use owo_colors::OwoColorize;
 use tuf_repo::event::{EventStatus, RoleStatus, SigningEvent};
-use tuf_repo::metadata::RoleName;
+use tuf_repo::policy::RoleName;
 use tuf_repo::report;
 use tuf_yubikey::{Device, Prompt};
 

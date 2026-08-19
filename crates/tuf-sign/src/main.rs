@@ -13,7 +13,7 @@ mod ui;
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use tuf_repo::event::RoleConfig;
-use tuf_repo::metadata::{Periods, RoleName};
+use tuf_repo::policy::{self, Periods, RoleName};
 use tuf_yubikey::YubikeySigner;
 
 use crate::config::{Config, GitRemotes, User};
@@ -244,10 +244,7 @@ fn sign(event: Option<String>) -> Result<()> {
         }
 
         let opened = open_signer(&session, &mut signer)?;
-        let (_, key) = opened
-            .key()
-            .as_metadata_key(&user)
-            .context("could not read your YubiKey's public key")?;
+        let key = opened.key().public_key.clone();
 
         for role in &tasks.accept {
             checkout.event.accept_invite(role, &user, key.clone())?;
@@ -301,7 +298,16 @@ fn init(event: &str) -> Result<()> {
         expiry_days: 365,
         signing_days: 60,
     };
-    checkout.event.initialize(default_periods)?;
+
+    // The repository starts with exactly one signer: whoever is creating it. TUF metadata
+    // naming a threshold it has no keys for is not valid metadata, so there is no earlier
+    // state to write.
+    ui::info("Your key will be the repository's first signer.");
+    let mut signer = None;
+    let opened = open_signer(&session, &mut signer)?;
+    checkout
+        .event
+        .initialize(default_periods, opened.key().public_key.clone(), &user)?;
 
     let root_config = roles::prompt_config(
         &RoleName::root(),
@@ -332,8 +338,10 @@ fn init(event: &str) -> Result<()> {
         "Snapshot and timestamp metadata are re-signed automatically, by a key that CI can \
          reach. Give the key CI will use.",
     );
-    let (key, timestamp, snapshot) = roles::prompt_online_key()?;
-    checkout.event.configure_online(key, timestamp, snapshot)?;
+    let (key, uri, timestamp, snapshot) = roles::prompt_online_key()?;
+    checkout
+        .event
+        .configure_online(key, &uri, timestamp, snapshot)?;
 
     accept_and_sign(&session, &mut checkout, &user)?;
     finish(
@@ -361,10 +369,10 @@ fn delegate(event: &str, role: Option<&str>) -> Result<()> {
     }
 
     let role = match role {
-        Some(role) => role.parse::<RoleName>()?,
+        Some(role) => policy::role_name(role)?,
         None => roles::choose_role(&checkout.event)?,
     };
-    if role.is_online() {
+    if policy::is_online(&role) {
         bail!(
             "{role} is signed automatically. Its key is configured together with snapshot's; \
              re-run `tuf-sign init` semantics are not needed, use the online key settings instead"
@@ -418,10 +426,7 @@ fn accept_and_sign(session: &Session, checkout: &mut Checkout, user: &str) -> Re
     if !tasks.accept.is_empty() {
         ui::heading("Adding your own key");
         let opened = open_signer(session, &mut signer)?;
-        let (_, key) = opened
-            .key()
-            .as_metadata_key(user)
-            .context("could not read your YubiKey's public key")?;
+        let key = opened.key().public_key.clone();
         for role in &tasks.accept {
             checkout.event.accept_invite(role, user, key.clone())?;
             ui::success(&format!("Added your key to {role}"));

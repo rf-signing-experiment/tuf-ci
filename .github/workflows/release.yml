@@ -23,9 +23,12 @@ jobs:
           # Nothing here pushes; `gh release create` uses GH_TOKEN directly.
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-unknown-linux-musl
+      # The runner image ships rustup, so the toolchain needs no third-party action.
+      - name: Install the toolchain
+        run: |
+          rustup toolchain install stable --profile minimal \
+            --target x86_64-unknown-linux-musl
+          rustup default stable
 
       # Statically linked, so the action does not care what the runner image ships.
       # tuf-ci depends on no smart-card libraries; only tuf-sign does, and that is not

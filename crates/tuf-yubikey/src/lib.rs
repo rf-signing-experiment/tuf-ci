@@ -22,8 +22,7 @@ use std::fmt;
 
 use sha2::{Digest, Sha256};
 use spki::der::Encode;
-use tuf_repo::crypto::{self, KeyId};
-use tuf_repo::metadata::Key;
+use tuf_repo::crypto::{self, KeyId, PublicKey};
 use tuf_repo::signer::Signer;
 use yubikey::piv::{AlgorithmId, ManagementAlgorithmId, SlotId};
 
@@ -149,8 +148,8 @@ pub trait Prompt {
 pub struct SlotKey {
     /// The public key, PEM encoded as a `SubjectPublicKeyInfo`.
     pub public_pem: String,
-    /// The id the repository files this key under.
-    pub key_id: KeyId,
+    /// The key itself, as the repository model reads it.
+    pub public_key: PublicKey,
     /// Whether the key requires a physical touch to sign.
     pub touch_policy: Option<TouchPolicy>,
     /// When the PIN must be presented.
@@ -160,9 +159,9 @@ pub struct SlotKey {
 }
 
 impl SlotKey {
-    /// This key as a repository key belonging to `owner`.
-    pub fn as_metadata_key(&self, owner: &str) -> tuf_repo::Result<(KeyId, Key)> {
-        Key::from_pem(&self.public_pem, owner)
+    /// The id the repository files this key under.
+    pub fn key_id(&self) -> &KeyId {
+        self.public_key.key_id()
     }
 
     /// Whether signing will ask for a physical touch.
@@ -245,10 +244,10 @@ pub fn slot_key(yubikey: &mut YubiKey) -> Result<SlotKey> {
         }
     };
 
-    let key_id = crypto::key_id(&spki_pem).map_err(|err| Error::Key(err.to_string()))?;
+    let public_key = crypto::public_key(&spki_pem).map_err(|err| Error::Key(err.to_string()))?;
     Ok(SlotKey {
         public_pem: spki_pem,
-        key_id,
+        public_key,
         touch_policy: policy.map(|(_, touch)| touch),
         pin_policy: policy.map(|(pin, _)| pin),
         from_slot_metadata,
@@ -312,12 +311,8 @@ impl<P: Prompt> YubikeySigner<P> {
 }
 
 impl<P: Prompt> Signer for YubikeySigner<P> {
-    fn public_key_pem(&self) -> &str {
-        &self.key.public_pem
-    }
-
-    fn key_id(&self) -> &KeyId {
-        &self.key.key_id
+    fn public_key(&self) -> &PublicKey {
+        &self.key.public_key
     }
 
     fn sign(&mut self, message: &[u8]) -> tuf_repo::Result<Vec<u8>> {
@@ -413,7 +408,7 @@ mod tests {
     fn slot_key(touch: Option<TouchPolicy>, pin: Option<PinPolicy>) -> SlotKey {
         SlotKey {
             public_pem: String::new(),
-            key_id: crypto::key_id(
+            public_key: crypto::public_key(
                 "-----BEGIN PUBLIC KEY-----\n\
                  MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEmcIqt4wpIdBCFSZv7EuQkTr7lHjR\n\
                  kyR5EgRkaB5Am9Zc61orKQc9DiOTs5e9d84px3ebGh1NhzMGBUZHiGB1ow==\n\

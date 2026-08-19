@@ -9,18 +9,18 @@
 
 use p256::ecdsa::signature::Signer as _;
 use p256::pkcs8::EncodePublicKey;
+use tuf::crypto::PublicKey;
 
-use crate::crypto::{self, KeyId};
+use crate::crypto;
 use crate::error::Result;
-use crate::metadata::Key;
 use crate::signer::Signer;
 
 /// A signer holding a private key in memory.
 #[derive(Clone)]
 pub struct MemorySigner {
     signing_key: p256::ecdsa::SigningKey,
+    public_key: PublicKey,
     public_pem: String,
-    key_id: KeyId,
     owner: String,
 }
 
@@ -36,19 +36,19 @@ impl MemorySigner {
             .verifying_key()
             .to_public_key_pem(p256::pkcs8::LineEnding::LF)
             .expect("a P-256 public key is encodable");
-        let key_id = crypto::key_id(&public_pem).expect("a freshly encoded key parses");
+        let public_key = crypto::public_key(&public_pem).expect("a freshly encoded key parses");
 
         MemorySigner {
             signing_key,
+            public_key,
             public_pem,
-            key_id,
             owner: owner.to_owned(),
         }
     }
 
-    /// The public half of this signer's key, ready to add to a delegation.
-    pub fn public_key(&self) -> (KeyId, Key) {
-        Key::from_pem(&self.public_pem, &self.owner).expect("a freshly encoded key parses")
+    /// The PEM this signer's public key was read from.
+    pub fn public_pem(&self) -> &str {
+        &self.public_pem
     }
 
     /// The `@handle` this signer signs as.
@@ -58,12 +58,8 @@ impl MemorySigner {
 }
 
 impl Signer for MemorySigner {
-    fn public_key_pem(&self) -> &str {
-        &self.public_pem
-    }
-
-    fn key_id(&self) -> &KeyId {
-        &self.key_id
+    fn public_key(&self) -> &PublicKey {
+        &self.public_key
     }
 
     fn sign(&mut self, message: &[u8]) -> Result<Vec<u8>> {
@@ -91,9 +87,18 @@ mod tests {
     #[test]
     fn signatures_verify_against_the_advertised_public_key() {
         let mut signer = MemorySigner::for_owner("@arlosi");
-        let signature = signer.sign(b"message").unwrap();
-        let (_, key) = signer.public_key();
-        key.verify(b"message", &signature).unwrap();
-        assert!(key.verify(b"different message", &signature).is_err());
+        let signature = signer.sign(b"payload").unwrap();
+        assert!(
+            signer
+                .public_key()
+                .verify_bytes(b"payload", &signature)
+                .is_ok()
+        );
+        assert!(
+            signer
+                .public_key()
+                .verify_bytes(b"other payload", &signature)
+                .is_err()
+        );
     }
 }

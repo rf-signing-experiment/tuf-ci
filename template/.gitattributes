@@ -1,0 +1,4 @@
+# Metadata bytes are what signatures cover, so nothing may rewrite them in transit.
+# A line-ending translation on checkout would invalidate every signature in the file.
+*.json -text
+*.sig.json -text

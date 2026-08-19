@@ -11,8 +11,9 @@ use std::path::Path;
 use std::process::{Command, Output};
 
 use chrono::{TimeZone, Utc};
+use tuf_repo::crypto::PublicKey;
 use tuf_repo::event::{RoleConfig, SigningEvent};
-use tuf_repo::metadata::{Key, Periods, RoleName};
+use tuf_repo::policy::{self, Periods, RoleName};
 use tuf_repo::signer::Signer as _;
 use tuf_repo::store::{EmptySource, FsSource, GitSource, RepoState, Writer};
 use tuf_repo::testing::MemorySigner;
@@ -134,46 +135,60 @@ fn config(signers: &[&str], threshold: u32) -> RoleConfig {
     }
 }
 
-fn online_key() -> Key {
-    let signer = MemorySigner::for_owner("online");
-    Key::online(
-        signer.public_key_pem(),
-        "gcpkms:projects/example/keys/online",
-    )
-    .expect("online key")
-    .1
+fn online_key() -> PublicKey {
+    MemorySigner::for_owner("online").public_key().clone()
 }
+
+/// Where CI would reach the online key.
+const ONLINE_URI: &str = "gcpkms:projects/example/keys/online";
 
 /// Create, sign and merge a repository's first metadata version.
 fn bootstrap(repo: &Repo, signers: &[&str], threshold: u32) {
+    let creator = signers.first().expect("at least one signer");
     let mut event = repo.event();
-    event.initialize(periods()).unwrap();
+    event
+        .initialize(
+            periods(),
+            MemorySigner::for_owner(creator).public_key().clone(),
+            creator,
+        )
+        .expect("initialize");
+    event
+        .configure_online(online_key(), ONLINE_URI, periods(), periods())
+        .expect("configure online roles");
     event
         .configure_role(&RoleName::root(), &config(signers, threshold))
-        .unwrap();
+        .expect("configure root");
     event
         .configure_role(&RoleName::targets(), &config(signers, threshold))
-        .unwrap();
-    event
-        .configure_online(online_key(), periods(), periods())
-        .unwrap();
+        .expect("configure targets");
 
     for name in signers {
-        let key = MemorySigner::for_owner(name).public_key().1;
-        event
-            .accept_invite(&RoleName::root(), name, key.clone())
-            .unwrap();
-        event
-            .accept_invite(&RoleName::targets(), name, key)
-            .unwrap();
+        let key = MemorySigner::for_owner(name).public_key().clone();
+        for role in [RoleName::root(), RoleName::targets()] {
+            if event.event_state().for_user(name).contains(&role) {
+                event
+                    .accept_invite(&role, name, key.clone())
+                    .expect("accept invite");
+            }
+        }
     }
+
     for name in signers {
         let mut signer = MemorySigner::for_owner(name);
-        event.sign(&RoleName::root(), &mut signer).unwrap();
-        event.sign(&RoleName::targets(), &mut signer).unwrap();
+        event
+            .sign(&RoleName::root(), &mut signer)
+            .expect("sign root");
+        event
+            .sign(&RoleName::targets(), &mut signer)
+            .expect("sign targets");
     }
-    assert!(event.status().is_mergeable(), "{:#?}", event.status());
 
+    assert!(
+        event.status().is_mergeable(),
+        "bootstrap should be mergeable: {:#?}",
+        event.status()
+    );
     repo.persist(&event, "Create root and targets metadata");
 }
 
@@ -321,7 +336,7 @@ fn an_invitation_holds_the_event_open_until_the_key_arrives() {
 
     // Bob accepts and everyone signs the resulting root.
     let mut event = repo.event();
-    let bob_key = MemorySigner::for_owner("@bob").public_key().1;
+    let bob_key = MemorySigner::for_owner("@bob").public_key().clone();
     event
         .accept_invite(&RoleName::targets(), "@bob", bob_key)
         .unwrap();
@@ -340,14 +355,14 @@ fn a_delegated_role_owns_its_own_directory() {
     let repo = Repo::new();
     bootstrap(&repo, &["@alice"], 1);
 
-    let crates: RoleName = "crates".parse().unwrap();
+    let crates: RoleName = policy::role_name("crates").unwrap();
 
     repo.git(&["switch", "--quiet", "--create", "sign/add-crates"]);
     let mut event = repo.event();
     event
         .configure_role(&crates, &config(&["@alice"], 1))
         .unwrap();
-    let alice_key = MemorySigner::for_owner("@alice").public_key().1;
+    let alice_key = MemorySigner::for_owner("@alice").public_key().clone();
     event.accept_invite(&crates, "@alice", alice_key).unwrap();
     let mut alice = MemorySigner::for_owner("@alice");
     event.sign(&RoleName::targets(), &mut alice).unwrap();

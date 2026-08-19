@@ -9,8 +9,9 @@
 use std::collections::BTreeMap;
 
 use chrono::{DateTime, TimeZone, Utc};
+use tuf_repo::crypto::PublicKey;
 use tuf_repo::event::{ArtifactChange, RoleConfig, SigningEvent};
-use tuf_repo::metadata::{Key, Periods, RoleName};
+use tuf_repo::policy::{self, Periods, RoleName};
 use tuf_repo::signer::Signer as _;
 use tuf_repo::store::{RepoState, Source, Writer};
 use tuf_repo::testing::MemorySigner;
@@ -93,7 +94,7 @@ impl Repo {
         let files = self.persist(event);
         self.main.0.extend(files.0);
         // Merging closes the event, so its state file goes with it.
-        if event.invites().is_empty() {
+        if event.event_state().is_empty() {
             self.main.0.remove("metadata/.signing-event.json");
         }
     }
@@ -103,6 +104,11 @@ impl Repo {
         let _ = self;
         files.0.insert(format!("targets/{path}"), contents.to_vec());
     }
+}
+
+/// The main branch's root metadata, as JSON.
+fn json_root(repo: &Repo) -> serde_json::Value {
+    serde_json::from_slice(repo.main.0.get("metadata/root.json").unwrap()).unwrap()
 }
 
 fn periods() -> Periods {
@@ -120,39 +126,43 @@ fn config(signers: &[&str], threshold: u32) -> RoleConfig {
     }
 }
 
-fn online_key() -> Key {
-    let signer = MemorySigner::for_owner("online");
-    let (_, key) = Key::online(
-        signer.public_key_pem(),
-        "gcpkms:projects/example/locations/global/keyRings/tuf/cryptoKeys/online",
-    )
-    .expect("online key");
-    key
+fn online_key() -> PublicKey {
+    MemorySigner::for_owner("online").public_key().clone()
 }
+
+/// Where CI would reach the online key.
+const ONLINE_URI: &str = "gcpkms:projects/example/locations/global/keyRings/tuf/cryptoKeys/online";
 
 /// Take a repository from nothing to a signed, merged first version.
 fn bootstrap(repo: &mut Repo, signers: &[&str], threshold: u32) {
+    let creator = signers.first().expect("at least one signer");
     let mut event = repo.event();
-    event.initialize(periods()).expect("initialize");
+    event
+        .initialize(
+            periods(),
+            MemorySigner::for_owner(creator).public_key().clone(),
+            creator,
+        )
+        .expect("initialize");
+    event
+        .configure_online(online_key(), ONLINE_URI, periods(), periods())
+        .expect("configure online roles");
     event
         .configure_role(&RoleName::root(), &config(signers, threshold))
         .expect("configure root");
     event
         .configure_role(&RoleName::targets(), &config(signers, threshold))
         .expect("configure targets");
-    event
-        .configure_online(online_key(), periods(), periods())
-        .expect("configure online roles");
 
     for name in signers {
-        let signer = MemorySigner::for_owner(name);
-        let (_, key) = signer.public_key();
-        event
-            .accept_invite(&RoleName::root(), name, key.clone())
-            .expect("accept root invite");
-        event
-            .accept_invite(&RoleName::targets(), name, key)
-            .expect("accept targets invite");
+        let key = MemorySigner::for_owner(name).public_key().clone();
+        for role in [RoleName::root(), RoleName::targets()] {
+            if event.event_state().for_user(name).contains(&role) {
+                event
+                    .accept_invite(&role, name, key.clone())
+                    .expect("accept invite");
+            }
+        }
     }
 
     for name in signers {
@@ -182,45 +192,63 @@ fn a_new_repository_needs_an_invitation_accepted_before_it_can_be_signed() {
     let mut repo = Repo::new();
     let mut event = repo.event();
 
-    event.initialize(periods()).unwrap();
+    // Whoever creates the repository is its first signer: metadata naming a threshold it
+    // has no keys for is not valid metadata, so there is no keyless state to start from.
+    let alice_key = MemorySigner::for_owner("@alice").public_key().clone();
+    event.initialize(periods(), alice_key, "@alice").unwrap();
     event
-        .configure_role(&RoleName::root(), &config(&["@alice"], 1))
-        .unwrap();
-    event
-        .configure_role(&RoleName::targets(), &config(&["@alice"], 1))
-        .unwrap();
-    event
-        .configure_online(online_key(), periods(), periods())
+        .configure_online(online_key(), ONLINE_URI, periods(), periods())
         .unwrap();
 
-    // Alice has been named as a signer but has contributed no key, so there is nothing
-    // worth signing yet: the key set is still going to change.
-    let tasks = event.tasks_for("@alice");
-    assert_eq!(tasks.accept, [RoleName::root(), RoleName::targets()]);
+    // Opening root up to a second signer at threshold two cannot be written yet: @bob has
+    // no key. The intent waits, and the event is not mergeable while it does.
+    event
+        .configure_role(&RoleName::root(), &config(&["@alice", "@bob"], 2))
+        .unwrap();
+
+    let tasks = event.tasks_for("@bob");
+    assert_eq!(tasks.accept, [RoleName::root()]);
     assert!(tasks.sign.is_empty());
     assert!(!event.status().is_mergeable());
+    assert_eq!(
+        event
+            .current()
+            .delegator_of(&RoleName::root())
+            .unwrap()
+            .role_spec(&RoleName::root())
+            .unwrap()
+            .threshold,
+        1,
+        "the threshold must not rise before the key that meets it exists",
+    );
 
-    let alice = MemorySigner::for_owner("@alice");
-    let (_, key) = alice.public_key();
+    // @bob accepts, and the configuration lands in the same step.
+    let bob_key = MemorySigner::for_owner("@bob").public_key().clone();
     event
-        .accept_invite(&RoleName::root(), "@alice", key.clone())
+        .accept_invite(&RoleName::root(), "@bob", bob_key)
         .unwrap();
-    event
-        .accept_invite(&RoleName::targets(), "@alice", key)
-        .unwrap();
+    assert_eq!(
+        event
+            .current()
+            .delegator_of(&RoleName::root())
+            .unwrap()
+            .role_spec(&RoleName::root())
+            .unwrap()
+            .threshold,
+        2,
+    );
+    assert!(event.event_state().is_empty(), "nothing should be pending");
 
-    let tasks = event.tasks_for("@alice");
-    assert!(tasks.accept.is_empty());
-    assert_eq!(tasks.sign, [RoleName::root(), RoleName::targets()]);
-
+    for name in ["@alice", "@bob"] {
+        let mut signer = MemorySigner::for_owner(name);
+        event.sign(&RoleName::root(), &mut signer).unwrap();
+    }
     let mut alice = MemorySigner::for_owner("@alice");
-    event.sign(&RoleName::root(), &mut alice).unwrap();
     event.sign(&RoleName::targets(), &mut alice).unwrap();
 
     let status = event.status();
     assert!(status.is_mergeable(), "{status:#?}");
     assert_eq!(status.outstanding(), 0);
-    assert_eq!(status.roles.len(), 2);
     for role in &status.roles {
         assert_eq!(role.version, 1, "{} should be version 1", role.role);
     }
@@ -288,7 +316,7 @@ fn adding_a_root_signer_needs_the_consent_of_the_signer_being_joined() {
         .unwrap();
 
     let bob = MemorySigner::for_owner("@bob");
-    let (_, bob_key) = bob.public_key();
+    let bob_key = bob.public_key().clone();
     event
         .accept_invite(&RoleName::root(), "@bob", bob_key)
         .unwrap();
@@ -360,7 +388,7 @@ fn several_changes_in_one_event_still_produce_one_new_version() {
         .configure_role(&RoleName::root(), &config(&["@alice"], 1))
         .unwrap();
     event
-        .configure_online(online_key(), periods(), periods())
+        .configure_online(online_key(), ONLINE_URI, periods(), periods())
         .unwrap();
     event
         .configure_role(
@@ -393,7 +421,7 @@ fn an_edit_that_changes_nothing_does_not_discard_signatures() {
         .configure_role(&RoleName::targets(), &config(&["@alice", "@bob"], 1))
         .unwrap();
     let bob = MemorySigner::for_owner("@bob");
-    let (_, bob_key) = bob.public_key();
+    let bob_key = bob.public_key().clone();
     event
         .accept_invite(&RoleName::targets(), "@bob", bob_key)
         .unwrap();
@@ -473,7 +501,7 @@ fn inviting_a_signer_does_not_by_itself_invalidate_signatures() {
     assert!(!event.status().is_mergeable());
 
     // Accepting does change root, and does cost Alice her signature.
-    let bob_key = MemorySigner::for_owner("@bob").public_key().1;
+    let bob_key = MemorySigner::for_owner("@bob").public_key().clone();
     event
         .accept_invite(&RoleName::targets(), "@bob", bob_key)
         .unwrap();
@@ -485,14 +513,14 @@ fn artifacts_are_assigned_to_the_role_that_owns_their_directory() {
     let mut repo = Repo::new();
     bootstrap(&mut repo, &["@alice"], 1);
 
-    let crates: RoleName = "crates".parse().unwrap();
+    let crates: RoleName = policy::role_name("crates").unwrap();
 
     // Delegate `crates` to Alice.
     let mut event = repo.event();
     event
         .configure_role(&crates, &config(&["@alice"], 1))
         .unwrap();
-    let alice_key = MemorySigner::for_owner("@alice").public_key().1;
+    let alice_key = MemorySigner::for_owner("@alice").public_key().clone();
     event.accept_invite(&crates, "@alice", alice_key).unwrap();
     let mut alice = MemorySigner::for_owner("@alice");
     event.sign(&RoleName::targets(), &mut alice).unwrap();
@@ -530,12 +558,12 @@ fn housekeeping_dotfiles_are_not_signed_as_artifacts() {
     let mut repo = Repo::new();
     bootstrap(&mut repo, &["@alice"], 1);
 
-    let crates: RoleName = "crates".parse().unwrap();
+    let crates: RoleName = policy::role_name("crates").unwrap();
     let mut event = repo.event();
     event
         .configure_role(&crates, &config(&["@alice"], 1))
         .unwrap();
-    let alice_key = MemorySigner::for_owner("@alice").public_key().1;
+    let alice_key = MemorySigner::for_owner("@alice").public_key().clone();
     event.accept_invite(&crates, "@alice", alice_key).unwrap();
     repo.merge(&event);
 
@@ -635,29 +663,29 @@ fn a_delegated_role_may_not_delegate_further() {
     let mut repo = Repo::new();
     bootstrap(&mut repo, &["@alice"], 1);
 
-    let crates: RoleName = "crates".parse().unwrap();
+    let crates: RoleName = policy::role_name("crates").unwrap();
+    let alice = MemorySigner::for_owner("@alice");
     let mut event = repo.event();
     event
         .configure_role(&crates, &config(&["@alice"], 1))
         .unwrap();
-    let alice_key = MemorySigner::for_owner("@alice").public_key().1;
-    event.accept_invite(&crates, "@alice", alice_key).unwrap();
 
     // The state machine has no API for nesting a delegation, so this checks the guard
-    // against metadata that arrived from somewhere else.
+    // against metadata that arrived from somewhere else. It has to be *valid* metadata:
+    // a delegation with no keys for its threshold would be rejected before this rule was
+    // ever consulted.
     let mut files = repo.persist(&event);
     let payload = files.0.get_mut("metadata/crates.json").unwrap();
     let mut json: serde_json::Value = serde_json::from_slice(payload).unwrap();
+    let key = &json_root(&repo)["keys"][alice.key_id().as_str()];
     json["delegations"] = serde_json::json!({
-        "keys": {},
+        "keys": { alice.key_id().as_str(): key },
         "roles": [{
             "name": "deeper",
-            "keyids": [],
+            "keyids": [alice.key_id().as_str()],
             "threshold": 1,
             "paths": ["deeper/*"],
             "terminating": true,
-            "x-tuf-ci-expiry-days": 365,
-            "x-tuf-ci-signing-days": 60,
         }],
     });
     *payload = serde_json::to_vec_pretty(&json).unwrap();
@@ -682,7 +710,7 @@ fn a_key_id_that_does_not_name_its_own_key_is_rejected() {
     event
         .configure_role(&RoleName::root(), &config(&["@alice", "@bob"], 1))
         .unwrap();
-    let bob_key = MemorySigner::for_owner("@bob").public_key().1;
+    let bob_key = MemorySigner::for_owner("@bob").public_key().clone();
     event
         .accept_invite(&RoleName::root(), "@bob", bob_key)
         .unwrap();
@@ -728,9 +756,12 @@ fn snapshot_and_timestamp_must_share_a_signer() {
 
     let mut json: serde_json::Value =
         serde_json::from_slice(repo.main.0.get("metadata/root.json").unwrap()).unwrap();
+    // Valid metadata that still breaks the rule: timestamp handed to a human's key while
+    // snapshot keeps the online one. Nothing in TUF forbids it; this project does, because
+    // one automated signer produces both.
+    let alice = MemorySigner::for_owner("@alice");
     json["version"] = serde_json::json!(2);
-    json["roles"]["timestamp"]["keyids"] = serde_json::json!([]);
-    json["roles"]["timestamp"]["threshold"] = serde_json::json!(0);
+    json["roles"]["timestamp"]["keyids"] = serde_json::json!([alice.key_id().as_str()]);
     let mut files = Files::default();
     files.0.insert(
         "metadata/root.json".into(),
@@ -753,12 +784,12 @@ fn a_revoked_delegation_takes_its_metadata_with_it() {
     let mut repo = Repo::new();
     bootstrap(&mut repo, &["@alice"], 1);
 
-    let crates: RoleName = "crates".parse().unwrap();
+    let crates: RoleName = policy::role_name("crates").unwrap();
     let mut event = repo.event();
     event
         .configure_role(&crates, &config(&["@alice"], 1))
         .unwrap();
-    let alice_key = MemorySigner::for_owner("@alice").public_key().1;
+    let alice_key = MemorySigner::for_owner("@alice").public_key().clone();
     event.accept_invite(&crates, "@alice", alice_key).unwrap();
     let mut alice = MemorySigner::for_owner("@alice");
     event.sign(&RoleName::targets(), &mut alice).unwrap();
@@ -884,14 +915,128 @@ fn an_event_with_no_changes_is_not_mergeable() {
 }
 
 #[test]
-fn key_ids_do_not_change_when_a_key_is_annotated() {
-    // The whole reason key ids are derived from key material rather than from the JSON key
-    // object: adding or changing an owner must not rename the key, because renaming it
-    // would invalidate every delegation that refers to it.
-    let signer = MemorySigner::for_owner("@alice");
-    let (bare_id, mut key) = Key::from_pem(signer.public_key_pem(), "@alice").unwrap();
-    key.owner = Some("@alice-with-a-new-handle".into());
-    key.extra
-        .insert("x-invented-later".into(), serde_json::json!(true));
-    assert_eq!(key.derived_key_id().unwrap(), bare_id);
+fn who_holds_a_key_is_recorded_beside_it_rather_than_inside_it() {
+    // Key objects in the metadata are plain TUF keys. Everything this project knows about
+    // a key — who holds it, where an automated signer reaches it — lives in one policy
+    // block at the document root, which is the only place the `tuf` crate preserves fields
+    // it does not understand. Anything written inside a key object would be dropped the
+    // first time any tool round-tripped the document.
+    let mut repo = Repo::new();
+    bootstrap(&mut repo, &["@alice"], 1);
+
+    let root = repo.event();
+    let root = root.current().root().unwrap();
+    let alice = MemorySigner::for_owner("@alice");
+
+    let key = root.payload().keys().get(alice.key_id()).unwrap();
+    let written: serde_json::Value = serde_json::from_slice(root.raw()).unwrap();
+    let key_json = &written["keys"][alice.key_id().as_str()];
+
+    assert_eq!(
+        key_json.as_object().unwrap().keys().collect::<Vec<_>>(),
+        ["keytype", "keyval", "scheme"],
+        "a key object carries nothing but what TUF defines: {key_json}"
+    );
+    assert_eq!(key.key_id(), alice.key_id());
+    assert_eq!(
+        written["x-tuf-ci"]["signers"][alice.key_id().as_str()],
+        serde_json::json!("@alice"),
+        "and the owner is recorded in the policy block instead"
+    );
+}
+
+#[test]
+fn one_key_filed_under_two_names_cannot_meet_a_threshold_of_two() {
+    // Key ids are opaque in TUF, so nothing in the format stops a role from listing the
+    // same public key twice under two names. If that went unnoticed, a role needing two
+    // signatures could be satisfied by one person signing once under each name.
+    let mut repo = Repo::new();
+    bootstrap(&mut repo, &["@alice"], 1);
+
+    let crates: RoleName = policy::role_name("crates").unwrap();
+    let mut event = repo.event();
+    event
+        .configure_role(&crates, &config(&["@alice"], 1))
+        .unwrap();
+    let alice_key = MemorySigner::for_owner("@alice").public_key().clone();
+    event.accept_invite(&crates, "@alice", alice_key).unwrap();
+    let mut alice = MemorySigner::for_owner("@alice");
+    event.sign(&RoleName::targets(), &mut alice).unwrap();
+    event.sign(&crates, &mut alice).unwrap();
+    repo.merge(&event);
+
+    // Now forge a second name for Alice's key and demand two signatures for `crates`.
+    let raw = repo.main.0.get("metadata/targets.json").unwrap().clone();
+    let mut targets: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+    let delegations = targets.get_mut("delegations").unwrap();
+    let (real_id, alice_entry) = {
+        let keys = delegations["keys"].as_object().unwrap();
+        let (id, key) = keys.iter().next().unwrap();
+        (id.clone(), key.clone())
+    };
+    let alias = "0".repeat(real_id.len());
+    delegations["keys"]
+        .as_object_mut()
+        .unwrap()
+        .insert(alias.clone(), alice_entry);
+    let role = &mut delegations["roles"].as_array_mut().unwrap()[0];
+    role["keyids"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!(alias));
+    role["threshold"] = serde_json::json!(2);
+
+    let mut files = Files::default();
+    files.0.insert(
+        "metadata/targets.json".into(),
+        serde_json::to_vec_pretty(&targets).unwrap(),
+    );
+
+    let status = repo.event_with(&files).status();
+    let problems: Vec<&String> = status.roles.iter().flat_map(|r| &r.problems).collect();
+    assert!(
+        problems
+            .iter()
+            .any(|p| p.contains("does not match its own key material")),
+        "a key filed under a name that is not its own must be reported: {problems:#?}"
+    );
+    assert!(
+        !status.is_mergeable(),
+        "and the event must not be mergeable"
+    );
+}
+
+#[test]
+fn a_signed_root_is_one_the_library_will_roll_forward() {
+    // The end-to-end claim this project rests on: what it writes is not merely metadata
+    // this crate is happy with, but metadata the TUF library's own trust engine accepts as
+    // a valid step from the previous root. Everything about the transition — the version
+    // advancing by exactly one, the new root satisfying both the outgoing key set and its
+    // own, neither having expired — is that engine's answer, not ours.
+    let mut repo = Repo::new();
+    bootstrap(&mut repo, &["@alice"], 1);
+
+    let mut event = repo.event();
+    event
+        .configure_role(&RoleName::root(), &config(&["@alice", "@bob"], 2))
+        .unwrap();
+    let bob_key = MemorySigner::for_owner("@bob").public_key().clone();
+    event
+        .accept_invite(&RoleName::root(), "@bob", bob_key)
+        .unwrap();
+
+    // Short of both signatures, the transition is not one a client would take.
+    let mut alice = MemorySigner::for_owner("@alice");
+    event.sign(&RoleName::root(), &mut alice).unwrap();
+    assert!(
+        event.check_root_chain().is_err(),
+        "one signature of two must not roll root forward"
+    );
+
+    let mut bob = MemorySigner::for_owner("@bob");
+    event.sign(&RoleName::root(), &mut bob).unwrap();
+    event
+        .check_root_chain()
+        .expect("a fully signed root rolls forward");
+    assert!(event.status().is_mergeable(), "{:#?}", event.status());
 }

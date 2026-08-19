@@ -1,8 +1,9 @@
 //! Asking about a role's signers, threshold and validity periods.
 
 use anyhow::{Context, Result, bail};
+use tuf_repo::crypto::{self, PublicKey};
 use tuf_repo::event::{RoleConfig, SigningEvent};
-use tuf_repo::metadata::{Key, Periods, RoleName};
+use tuf_repo::policy::{self, Periods, RoleName};
 
 use crate::config::normalize_handle;
 use crate::ui;
@@ -19,9 +20,9 @@ pub fn current_config(event: &SigningEvent, role: &RoleName) -> Option<RoleConfi
     let mut signers: Vec<String> = delegator
         .keys_for(role)
         .into_iter()
-        .filter_map(|(_, key)| key.owner.clone())
+        .filter_map(|(key_id, _)| delegator.policy().signers.get(&key_id).cloned())
         .collect();
-    for invited in event.invites().for_role(role) {
+    for invited in event.event_state().for_role(role) {
         if !signers.iter().any(|signer| signer == invited) {
             signers.push(invited.to_owned());
         }
@@ -41,7 +42,7 @@ pub fn choose_role(event: &SigningEvent) -> Result<RoleName> {
         .current()
         .role_names()
         .into_iter()
-        .filter(|role| !role.is_online())
+        .filter(|role| !policy::is_online(role))
         .map(|role| role.to_string())
         .collect();
     options.push("a new delegated role…".to_owned());
@@ -49,12 +50,9 @@ pub fn choose_role(event: &SigningEvent) -> Result<RoleName> {
     let choice = ui::select("Which role?", options)?;
     if choice.starts_with("a new") {
         let name = ui::text("Name for the new role", None)?;
-        return name
-            .trim()
-            .parse()
-            .context("that is not a usable role name");
+        return policy::role_name(name.trim()).context("that is not a usable role name");
     }
-    choice.parse().context("that is not a usable role name")
+    policy::role_name(&choice).context("that is not a usable role name")
 }
 
 /// Walk through a role's settings, showing the current values and changing what is asked.
@@ -178,7 +176,7 @@ fn prompt_periods(role: &RoleName, current: Periods) -> Result<Periods> {
 /// The public key is read from a file rather than fetched from the key service, because
 /// this tool deliberately talks to nothing but git and the YubiKey. Export it once, with
 /// e.g. `gcloud kms keys versions get-public-key`.
-pub fn prompt_online_key() -> Result<(Key, Periods, Periods)> {
+pub fn prompt_online_key() -> Result<(PublicKey, String, Periods, Periods)> {
     let uri = ui::text(
         "URI CI will use to reach the online key (e.g. gcpkms:projects/…/cryptoKeyVersions/1)",
         None,
@@ -191,7 +189,7 @@ pub fn prompt_online_key() -> Result<(Key, Periods, Periods)> {
     let pem =
         std::fs::read_to_string(path.trim()).with_context(|| format!("reading {}", path.trim()))?;
 
-    let (_, key) = Key::online(&pem, uri.trim()).context("that is not a usable public key")?;
+    let key = crypto::public_key(&pem).context("that is not a usable public key")?;
 
     ui::info(
         "Timestamp metadata is short-lived and re-signed often; snapshot follows the offline \
@@ -212,5 +210,5 @@ pub fn prompt_online_key() -> Result<(Key, Periods, Periods)> {
         },
     )?;
 
-    Ok((key, timestamp, snapshot))
+    Ok((key, uri.trim().to_owned(), timestamp, snapshot))
 }

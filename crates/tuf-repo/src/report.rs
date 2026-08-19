@@ -21,12 +21,25 @@ pub fn markdown(status: &EventStatus, event_name: &str) -> String {
     let _ = writeln!(out, "{}", headline(status));
     let _ = writeln!(out);
 
-    if status.roles.is_empty() {
+    if status.roles.is_empty() && status.invitations.is_empty() {
         let _ = writeln!(
             out,
             "This branch changes no metadata yet. Commit an artifact under `targets/`, or run \
              `{SIGN_COMMAND} delegate {event_name} <role>` to change a delegation."
         );
+        return finish(out, status);
+    }
+
+    // A configuration waiting on a key changes no metadata yet, so there can be
+    // invitations to report with no roles beside them.
+    if status.roles.is_empty() {
+        let _ = writeln!(
+            out,
+            "This branch changes no metadata yet: the configuration it proposes needs a key \
+             that has not arrived."
+        );
+        let _ = writeln!(out);
+        write_invitations(&mut out, status, event_name);
         return finish(out, status);
     }
 
@@ -54,24 +67,7 @@ pub fn markdown(status: &EventStatus, event_name: &str) -> String {
     }
     let _ = writeln!(out);
 
-    let invitations = status.invitations();
-    if !invitations.is_empty() {
-        let _ = writeln!(out, "#### Invitations");
-        let _ = writeln!(out);
-        for invitation in invitations {
-            let _ = writeln!(
-                out,
-                "- `{}` has been invited to sign `{}`",
-                invitation.user, invitation.role
-            );
-        }
-        let _ = writeln!(out);
-        let _ = writeln!(
-            out,
-            "Invitees: run `{SIGN_COMMAND} {event_name}` to add your key."
-        );
-        let _ = writeln!(out);
-    }
+    write_invitations(&mut out, status, event_name);
 
     // The report is the notification: somebody reading it should not have to look up what
     // to do about it.
@@ -137,6 +133,29 @@ fn finish(mut out: String, status: &EventStatus) -> String {
         );
     }
     out
+}
+
+/// List who has been invited and how they answer.
+fn write_invitations(out: &mut String, status: &EventStatus, event_name: &str) {
+    let invitations = status.invitations();
+    if invitations.is_empty() {
+        return;
+    }
+    let _ = writeln!(out, "#### Invitations");
+    let _ = writeln!(out);
+    for invitation in invitations {
+        let _ = writeln!(
+            out,
+            "- `{}` has been invited to sign `{}`",
+            invitation.user, invitation.role
+        );
+    }
+    let _ = writeln!(out);
+    let _ = writeln!(
+        out,
+        "Invitees: run `{SIGN_COMMAND} {event_name}` to add your key."
+    );
+    let _ = writeln!(out);
 }
 
 /// The one-line summary at the top of the report.
@@ -262,18 +281,20 @@ pub fn summarize_artifacts(changes: &[ArtifactChange]) -> String {
 mod tests {
     use super::*;
     use crate::event::{ArtifactChange, Invitation};
-    use crate::metadata::RoleName;
+    use crate::policy::RoleName;
     use crate::store::{SignerRef, Tally};
 
     fn signer(name: &str) -> SignerRef {
         SignerRef {
-            key_id: crate::crypto::key_id(
+            key_id: crate::crypto::public_key(
                 "-----BEGIN PUBLIC KEY-----\n\
                  MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEmcIqt4wpIdBCFSZv7EuQkTr7lHjR\n\
                  kyR5EgRkaB5Am9Zc61orKQc9DiOTs5e9d84px3ebGh1NhzMGBUZHiGB1ow==\n\
                  -----END PUBLIC KEY-----\n",
             )
-            .unwrap(),
+            .unwrap()
+            .key_id()
+            .clone(),
             name: name.to_owned(),
         }
     }
@@ -301,6 +322,7 @@ mod tests {
     fn a_complete_event_says_so() {
         let status = EventStatus {
             roles: vec![role(&["@alice", "@bob"], &[], 2)],
+            invitations: Vec::new(),
             problems: Vec::new(),
         };
         assert_eq!(headline(&status), "Fully signed and ready to merge.");
@@ -313,6 +335,7 @@ mod tests {
     fn an_incomplete_event_counts_what_is_missing() {
         let status = EventStatus {
             roles: vec![role(&["@alice"], &["@bob"], 2)],
+            invitations: Vec::new(),
             problems: Vec::new(),
         };
         assert_eq!(headline(&status), "Waiting on 1 more signature.");
@@ -332,6 +355,7 @@ mod tests {
         role.problems.push("targets is version 9, but …".into());
         let status = EventStatus {
             roles: vec![role],
+            invitations: Vec::new(),
             problems: Vec::new(),
         };
         assert!(headline(&status).contains("cannot be merged"));
@@ -347,6 +371,10 @@ mod tests {
         });
         let status = EventStatus {
             roles: vec![role],
+            invitations: vec![Invitation {
+                user: "@bob".into(),
+                role: RoleName::targets(),
+            }],
             problems: Vec::new(),
         };
         let rendered = markdown(&status, "sign/add-bob");
@@ -393,6 +421,7 @@ mod tests {
     fn an_empty_event_explains_what_to_do_instead_of_showing_an_empty_table() {
         let status = EventStatus {
             roles: Vec::new(),
+            invitations: Vec::new(),
             problems: Vec::new(),
         };
         let rendered = markdown(&status, "sign/empty");

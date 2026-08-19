@@ -10,13 +10,19 @@ Signers run `tuf-sign`, which reads the same state and puts a signature on it.
 
 ```
 crates/
-  tuf-repo/      the metadata model and the signing-event state machine
+  tuf-repo/      the signing-event state machine, over the `tuf` crate's metadata
   tuf-yubikey/   signing with PIV slot 9c
   tuf-sign/      the tool a signer runs
   tuf-ci/        the tool GitHub Actions runs
 actions/
   signing-event/ the composite action a TUF repository uses
+template/        a TUF repository, ready to be copied
 ```
+
+`template/` is a starting point for the repository being administered, not part of this
+one. Its workflows sit under `template/.github/workflows/`, which GitHub Actions does not
+read — only the `.github/workflows/` at a repository root runs — so they are inert here
+and live the moment the folder is copied to a repository of its own.
 
 ## Repository layout
 
@@ -29,7 +35,7 @@ metadata/
   crates.json                  a delegated role
   crates.sig.json
   root_history/1.root.json     every published root, for clients walking the chain
-  .signing-event.json          open invitations, present only during an event
+  .signing-event.json          invitations and pending configuration, during an event
 targets/
   top-level.txt                owned by the `targets` role
   crates/serde                 owned by the `crates` role
@@ -43,7 +49,26 @@ a canonical JSON dialect.
 Payload and signatures are kept in separate files so that git diffs stay useful: adding a
 signature produces a four-line diff and touches nothing else, and a metadata change reads
 as JSON rather than as a base64 blob. The two are combined into a published DSSE envelope
-at publish time.
+at publish time, by concatenation — the payload's bytes are authored once and frozen, since
+any reformat would invalidate every signature already collected.
+
+The metadata itself is the [`tuf`](https://github.com/theupdateframework/rust-tuf) crate's
+model, read and written through POUF-2. This project adds one object at the root of each
+document for the things TUF has no opinion about:
+
+```jsonc
+"x-tuf-ci": {
+  "signers": { "bd828d85…": "@arlosi" },              // who holds each offline key
+  "online":  { "6d1392ab…": "gcpkms:projects/…" },    // where CI reaches each online key
+  "periods": { "root": { "expiry-days": 365, "signing-days": 60 } }
+}
+```
+
+One block, at the top level, never nested inside a key or a role — that is the only place
+unrecognised fields survive a round trip, so anything written deeper would be silently
+dropped the first time a tool rewrote the document. Keeping it inside the payload also
+keeps it signed: how long a role's word is good for is part of what the delegating role's
+signers attest to.
 
 ## Using it
 
@@ -84,16 +109,16 @@ signing event, because a `push` event runs the workflow as it exists in the push
 not the one on the base branch — so a `sign/*` branch cut from a base branch without the
 workflow will push successfully and then do nothing at all.
 
-1. Create the repository from the
-   [template repository](https://github.com/rf-signing-experiment/tuf-repository), which
-   carries the workflow, a `.gitattributes` that keeps signature-covered bytes from being
-   mangled, and an empty `targets/`. Delete the template's `metadata/`.
+1. Copy [`template/`](template) into the new repository. It carries the workflow, a
+   `.gitattributes` that keeps signature-covered bytes from being mangled, an empty
+   `targets/`, and a README with the same steps for whoever runs it.
 2. Repoint the `uses:` in `.github/workflows/signing-event.yml` at the `tuf-ci` commit you
-   want to run.
+   want to run, pinned by SHA.
 3. Create the GitHub App, **install it on the new repository**, and add
    `TUF_CI_APP_CLIENT_ID` and `TUF_CI_APP_PRIVATE_KEY`.
 4. Push all of that to `main`.
-5. Only now run `tuf-sign init sign/init`.
+5. Only now run `tuf-sign init sign/init` — whoever runs it becomes the repository's first
+   signer, so it needs a YubiKey to hand.
 
 ```yaml
 # <your-tuf-repo>/.github/workflows/signing-event.yml
@@ -206,8 +231,13 @@ which role owns an artifact is decided by its path, not by a tree walk.
 
 A role's signers, threshold and validity periods all live in the role that delegates to it,
 so one document says everything about a delegation. Key ids are `sha256` of the DER
-`SubjectPublicKeyInfo`, which means annotating a key — recording who owns it, say — does
-not rename it.
+`SubjectPublicKeyInfo`, which means recording who owns a key never renames it.
+
+Metadata on a signing-event branch is always *valid* TUF metadata — it just has fewer
+signatures than it needs. A configuration that cannot be written validly yet, such as
+raising a threshold to two before the second signer has a key, waits in
+`.signing-event.json` and lands the moment the last invitation is accepted. So a branch
+never holds metadata that a client, or this tool, would refuse to parse.
 
 `snapshot` and `timestamp` are signed by an automated key and never take part in a signing
 event; a branch that changes them is reported as an error.
@@ -224,6 +254,7 @@ event; a branch that changes them is reported as an error.
 | Hardware access | PKCS#11 via `libykcs11`, configured by path | PC/SC directly |
 | PR reporting | a new comment on every run | the pull request body, updated in place, plus a check run |
 | Role periods | on the delegate for offline roles, on the delegator for online ones | on the delegator, always |
+| Metadata model | its own | the `tuf` crate's, with one extension object per document |
 
 ## Not implemented yet
 

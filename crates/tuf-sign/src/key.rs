@@ -10,7 +10,7 @@
 
 use anyhow::{Context, Result, bail};
 use owo_colors::OwoColorize;
-use tuf_repo::crypto;
+
 use tuf_repo::signer::Signer as _;
 use tuf_yubikey::{Device, PinPolicy, SlotKey, TouchPolicy};
 
@@ -110,7 +110,7 @@ fn report(device: &Device, sign_test: bool) -> Result<bool> {
 
     println!("\n  {}", "PIV slot 9c (Digital Signature)".bold());
     println!("  {:<14}ECDSA P-256", "Algorithm");
-    println!("  {:<14}{}", "Key id", key.key_id);
+    println!("  {:<14}{}", "Key id", key.key_id());
     println!("  {:<14}{}", "PIN policy", describe_pin(&key));
     println!("  {:<14}{}", "Touch policy", describe_touch(&key));
     println!("  {:<14}{}", "Read from", source(&key, device));
@@ -161,13 +161,7 @@ fn verify_signing(device: &Device, key: &SlotKey) -> Result<bool> {
         }
     };
 
-    match crypto::verify(
-        crypto::KEYTYPE_ECDSA,
-        crypto::ECDSA_SHA2_NISTP256,
-        &key.public_pem,
-        TEST_MESSAGE,
-        &signature,
-    ) {
+    match key.public_key.verify_bytes(TEST_MESSAGE, &signature) {
         Ok(()) => {
             ui::success(&format!(
                 "Signed and verified ({} byte signature).",
@@ -223,11 +217,12 @@ fn source(key: &SlotKey, device: &Device) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tuf_repo::crypto;
 
     fn slot_key(pin: Option<PinPolicy>, touch: Option<TouchPolicy>, meta: bool) -> SlotKey {
         SlotKey {
             public_pem: String::new(),
-            key_id: crypto::key_id(
+            public_key: crypto::public_key(
                 "-----BEGIN PUBLIC KEY-----\n\
                  MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEmcIqt4wpIdBCFSZv7EuQkTr7lHjR\n\
                  kyR5EgRkaB5Am9Zc61orKQc9DiOTs5e9d84px3ebGh1NhzMGBUZHiGB1ow==\n\

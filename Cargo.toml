@@ -37,4 +37,3 @@ inquire = "0.9"
 owo-colors = "4"
 toml = "1.1.4"
 tempfile = "3"
-

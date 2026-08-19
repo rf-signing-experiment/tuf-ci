@@ -1,0 +1,36 @@
+# Reports on TUF signing events and gates their merge.
+#
+# This file must be on the base branch *before* the first signing event branches off it.
+# A push event runs the workflow as it exists in the pushed commit, so a `sign/*` branch
+# whose history predates this file will push successfully and then do nothing at all.
+name: TUF signing event
+
+on:
+  push:
+    branches: ['sign/**']
+  # So a branch created before this workflow existed can still be reported on, without
+  # having to be rebased.
+  workflow_dispatch:
+
+permissions: {} # the App token carries its own
+
+jobs:
+  signing-event:
+    name: TUF signing event
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mint a token for the tuf-ci App
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          # The App's Client ID (Iv23li…), not its numeric App ID: `app-id` still works
+          # but is deprecated. Both are on the App's settings page.
+          client-id: ${{ vars.TUF_CI_APP_CLIENT_ID }}
+          private-key: ${{ secrets.TUF_CI_APP_PRIVATE_KEY }}
+
+      # Repoint this at the tuf-ci commit you want to run, and pin it by SHA.
+      - name: Report on the signing event
+        uses: rf-signing-experiment/tuf-ci/actions/signing-event@main
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          app-slug: ${{ steps.app-token.outputs.app-slug }}
