@@ -1,4 +1,4 @@
-//! Key identity and signature verification, all of it the `tuf` crate's.
+//! Key identity and signature verification.
 //!
 //! A key is a [`tuf::crypto::PublicKey`], which names itself:
 //!

@@ -843,6 +843,25 @@ impl<'a> Delegator<'a> {
         })
     }
 
+    /// Whether an automated key signs `role`, rather than people.
+    ///
+    /// Read out of this document's own key records: a key is online because the repository
+    /// records a signing URI for it, so the same rule answers for `snapshot` and for a
+    /// delegated role handed to automation. Nothing here looks at what the role is called.
+    ///
+    /// A role with no keys is not online, and neither is one whose keys are only partly
+    /// online — that is a misconfiguration rather than a third kind of role, and
+    /// [`crate::event`] reports it as one.
+    pub fn is_online(&self, role: &MetadataPath) -> bool {
+        match self.role_spec(role) {
+            Some(spec) if !spec.keyids.is_empty() => spec
+                .keyids
+                .iter()
+                .all(|key_id| self.policy().is_online_key(key_id)),
+            _ => false,
+        }
+    }
+
     /// Look up one of this role's keys.
     pub fn key(&self, key_id: &KeyId) -> Option<&'a PublicKey> {
         match self {

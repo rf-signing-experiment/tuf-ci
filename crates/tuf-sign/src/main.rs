@@ -12,7 +12,6 @@ mod ui;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use tuf_repo::event::RoleConfig;
 use tuf_repo::policy::{self, Periods, RoleName};
 use tuf_yubikey::YubikeySigner;
 
@@ -309,39 +308,22 @@ fn init(event: &str) -> Result<()> {
         .event
         .initialize(default_periods, opened.key().public_key.clone(), &user)?;
 
-    let root_config = roles::prompt_config(
-        &RoleName::root(),
-        &RoleConfig {
-            signers: vec![user.clone()],
-            threshold: 1,
-            periods: default_periods,
-        },
-    )?;
-    checkout
-        .event
-        .configure_role(&RoleName::root(), &root_config)?;
+    // Every role is configured the same way, and the answers are the operator's: nothing
+    // here decides that timestamp is automated, only that it is usually the sensible
+    // choice.
+    for role in [RoleName::root(), RoleName::targets()] {
+        roles::configure(&mut checkout.event, &role)?;
+    }
 
-    let targets_config = roles::prompt_config(
-        &RoleName::targets(),
-        &RoleConfig {
-            signers: root_config.signers.clone(),
-            threshold: root_config.threshold,
-            periods: root_config.periods,
-        },
-    )?;
-    checkout
-        .event
-        .configure_role(&RoleName::targets(), &targets_config)?;
-
-    ui::heading("Online signing key");
+    ui::heading("Snapshot and timestamp");
     ui::info(
-        "Snapshot and timestamp metadata are re-signed automatically, by a key that CI can \
-         reach. Give the key CI will use.",
+        "These are re-signed every time anything else changes, and timestamp expires in \
+         days rather than months. Almost every repository gives them a key CI can reach \
+         rather than asking people to sign that often.",
     );
-    let (key, uri, timestamp, snapshot) = roles::prompt_online_key()?;
-    checkout
-        .event
-        .configure_online(key, &uri, timestamp, snapshot)?;
+    for role in [RoleName::snapshot(), RoleName::timestamp()] {
+        roles::configure(&mut checkout.event, &role)?;
+    }
 
     accept_and_sign(&session, &mut checkout, &user)?;
     finish(
@@ -372,35 +354,14 @@ fn delegate(event: &str, role: Option<&str>) -> Result<()> {
         Some(role) => policy::role_name(role)?,
         None => roles::choose_role(&checkout.event)?,
     };
-    if policy::is_online(&role) {
-        bail!(
-            "{role} is signed automatically. Its key is configured together with snapshot's; \
-             re-run `tuf-sign init` semantics are not needed, use the online key settings instead"
-        );
+    let existed = roles::current_config(&checkout.event, &role).is_some();
+    if existed {
+        ui::heading(&format!("Changing {role}"));
+    } else {
+        ui::heading(&format!("Creating a delegation to {role}"));
     }
 
-    let existing = roles::current_config(&checkout.event, &role);
-    match &existing {
-        Some(_) => ui::heading(&format!("Changing the delegation to {role}")),
-        None => ui::heading(&format!("Creating a delegation to {role}")),
-    }
-
-    let default = existing.clone().unwrap_or(RoleConfig {
-        signers: vec![user.clone()],
-        threshold: 1,
-        periods: Periods {
-            expiry_days: 365,
-            signing_days: 60,
-        },
-    });
-    let config = roles::prompt_config(&role, &default)?;
-
-    if Some(&config) == existing.as_ref() {
-        ui::info("No changes.");
-        return Ok(());
-    }
-
-    if !checkout.event.configure_role(&role, &config)? {
+    if !roles::configure(&mut checkout.event, &role)? {
         ui::info("No changes.");
         return Ok(());
     }

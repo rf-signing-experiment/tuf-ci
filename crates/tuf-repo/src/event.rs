@@ -131,22 +131,32 @@ pub struct RoleStatus {
     pub delegations: Vec<DelegationChange>,
     /// Reasons this role's metadata is not acceptable, irrespective of signatures.
     pub problems: Vec<String>,
+    /// Whether an automated key signs this role rather than people.
+    pub online: bool,
 }
 
 impl RoleStatus {
     /// Whether this role is fully signed, valid, and not waiting on an invitation.
+    ///
+    /// An online role is complete as soon as it is valid. Its signature is applied by
+    /// automation when the repository is published, so holding a signing event open until
+    /// it appears would be waiting for something nobody taking part can do.
     pub fn is_complete(&self) -> bool {
         self.problems.is_empty()
             && self.blocking_invites.is_empty()
-            && self.tally.is_met()
-            && self
-                .previous_tally
-                .as_ref()
-                .is_none_or(|previous| previous.is_met())
+            && (self.online
+                || (self.tally.is_met()
+                    && self
+                        .previous_tally
+                        .as_ref()
+                        .is_none_or(|previous| previous.is_met())))
     }
 
-    /// How many more signatures this role needs.
+    /// How many more signatures this role needs from people.
     pub fn outstanding(&self) -> u32 {
+        if self.online {
+            return 0;
+        }
         let previous = self
             .previous_tally
             .as_ref()
@@ -156,6 +166,9 @@ impl RoleStatus {
 
     /// Everyone whose signature is still wanted.
     pub fn waiting_on(&self) -> Vec<&str> {
+        if self.online {
+            return Vec::new();
+        }
         let mut names: Vec<&str> = self
             .tally
             .missing
@@ -289,6 +302,32 @@ impl SigningEvent {
             .into_iter()
             .filter(|role| self.role_changed(role))
             .collect()
+    }
+
+    /// Whether `role` is signed by an automated key rather than by people.
+    ///
+    /// Derived from the delegating document, which is where the repository records that a
+    /// key is reachable by CI. Deliberately not a property of the role's name: `snapshot`
+    /// and `timestamp` are online because an online key was configured for them, and a
+    /// delegated role — a nightly channel whose artifacts land faster than people can sign
+    /// for them — is online on exactly the same terms.
+    pub fn is_online(&self, role: &MetadataPath) -> bool {
+        self.current
+            .delegator_of(role)
+            .is_ok_and(|delegator| delegator.is_online(role))
+    }
+
+    /// Every role an automated key signs.
+    ///
+    /// Root is never among them however its keys are recorded: it is the trust anchor, and
+    /// [`status`](Self::status) reports an online key in root as the fault it is rather
+    /// than quietly treating root as automated.
+    pub fn online_roles(&self) -> Vec<MetadataPath> {
+        let mut roles = self.current.role_names();
+        roles.push(MetadataPath::snapshot());
+        roles.push(MetadataPath::timestamp());
+        roles.retain(|role| *role != MetadataPath::root() && self.is_online(role));
+        roles
     }
 
     fn role_changed(&self, role: &MetadataPath) -> bool {
@@ -432,7 +471,7 @@ impl SigningEvent {
         // Online metadata is re-signed on every publish with a key CI holds. A signing
         // event that changes it either has a stale checkout or is trying something it
         // should not, and either way the change cannot be signed here.
-        for role in [MetadataPath::snapshot(), MetadataPath::timestamp()] {
+        for role in self.online_roles() {
             let known_good = self.known_good.raw_payload(&role);
             if known_good.is_some() && self.current.raw_payload(&role) != known_good {
                 problems.push(format!(
@@ -539,6 +578,7 @@ impl SigningEvent {
             version,
             tally,
             previous_tally,
+            online: self.is_online(role),
             blocking_invites: self.blocking_invites(role),
             artifacts: self.artifact_changes(role),
             delegations: self.delegation_changes(role),
@@ -620,11 +660,6 @@ impl SigningEvent {
     }
 
     /// Everything wrong with `role`'s metadata that signatures cannot fix.
-    ///
-    /// Much less than it used to check. A role naming a threshold it has no keys for, a
-    /// root missing one of the four top-level delegations, a threshold of zero — none of
-    /// those can be built any more, because `tuf`'s constructors refuse them. What is left
-    /// is what this project knows and TUF does not.
     fn validate(&self, role: &MetadataPath) -> Vec<String> {
         let mut problems = Vec::new();
 
@@ -671,23 +706,35 @@ impl SigningEvent {
                 }
             }
 
-            // Offline roles are signed by people, online roles by automation. A key with
-            // neither marking cannot be attributed to either.
+            // Every key has to be attributable to a person or to an automated signer,
+            // because that is what decides whether this role waits for a signing event or
+            // for the next publish. A key that is both, or neither, decides nothing.
             let policy = delegator.policy();
+            let (mut online, mut offline) = (0usize, 0usize);
             for (key_id, _) in delegator.keys_for(role) {
-                let known_signer = policy.signers.contains_key(&key_id);
-                let known_online = policy.online.contains_key(&key_id);
-                match (policy::is_online(role), known_signer, known_online) {
-                    (false, false, _) => problems.push(format!(
+                match (
+                    policy.signers.contains_key(&key_id),
+                    policy.is_online_key(&key_id),
+                ) {
+                    (true, false) => offline += 1,
+                    (false, true) => online += 1,
+                    (false, false) => problems.push(format!(
                         "{role} key {} has no owner, so nobody can be asked to sign with it",
                         crypto::abbreviated(&key_id)
                     )),
-                    (true, _, false) => problems.push(format!(
-                        "{role} is signed online but key {} has no signing URI",
+                    (true, true) => problems.push(format!(
+                        "{role} key {} is recorded both as a person's key and as an online \
+                         key, so what signs it is undecided",
                         crypto::abbreviated(&key_id)
                     )),
-                    _ => {}
                 }
+            }
+            if online > 0 && offline > 0 {
+                problems.push(format!(
+                    "{role} mixes an online key with a person's key. A role is signed either \
+                     by automation on every publish or by people in a signing event, and the \
+                     two cannot be combined into one threshold."
+                ));
             }
         }
 
@@ -734,14 +781,18 @@ impl SigningEvent {
             );
         }
 
-        // Snapshot and timestamp are produced together by the same automated signer, so a
-        // configuration where one could be signed without the other is a mistake.
-        if root.snapshot().key_ids() != root.timestamp().key_ids()
-            || root.snapshot().threshold() != root.timestamp().threshold()
+        // Root is the trust anchor. A key CI can reach is a key that can rewrite every
+        // other role's key set with nobody signing for it, which is the one thing offline
+        // signing exists to prevent.
+        if self
+            .current
+            .root
+            .as_ref()
+            .is_some_and(|signed| signed.delegator().is_online(&MetadataPath::root()))
         {
             problems.push(
-                "snapshot and timestamp must be signed by the same keys, since both are \
-                 produced by the same online signer"
+                "root is signed by an online key. Root must be signed offline: a key CI can \
+                 reach could replace every other role's keys unopposed."
                     .into(),
             );
         }
@@ -808,11 +859,6 @@ impl SigningEvent {
     ///
     /// Returns whether anything changed.
     pub fn configure_role(&mut self, role: &MetadataPath, config: &RoleConfig) -> Result<bool> {
-        if policy::is_online(role) {
-            return Err(Error::invalid(format!(
-                "{role} is signed online; configure it with the online key instead"
-            )));
-        }
         config.validate(role)?;
 
         let before = self.current.event.clone();
@@ -889,43 +935,64 @@ impl SigningEvent {
             .collect()
     }
 
-    /// Set the key and periods for the online roles.
+    /// Hand a role to an automated key.
     ///
-    /// Snapshot and timestamp are always configured together and always with the same key,
-    /// because one automated signer produces both: allowing them to differ would let a
-    /// repository publish a timestamp for a snapshot nobody could have signed.
+    /// The counterpart of [`configure_role`](Self::configure_role): that one says which
+    /// people sign, this one says which key CI signs with. Either can be applied to any
+    /// role, and either replaces whatever was there — so a channel can be moved to
+    /// automation when it starts releasing nightly, and moved back to people when it stops.
+    /// Whichever was displaced is forgotten, keys and all.
+    ///
+    /// A role signed this way takes no part in signing events: its metadata is re-signed by
+    /// whatever holds `uri` whenever it changes, and a branch that edits it is an error.
+    /// The delegation is also the whole of the key's authority. It may sign this one role's
+    /// metadata, over the artifact paths the delegation already names, and nothing else: it
+    /// cannot widen its own reach, touch another role, or change who is allowed to sign.
+    /// Those still take people.
+    ///
+    /// Root is the exception, and the only role this refuses. It is the trust anchor, and a
+    /// key CI can reach could rewrite every other role's keys unopposed.
     ///
     /// Returns whether anything changed.
-    pub fn configure_online(
+    pub fn configure_online_role(
         &mut self,
+        role: &MetadataPath,
         key: PublicKey,
         uri: &str,
-        timestamp: Periods,
-        snapshot: Periods,
+        periods: Periods,
     ) -> Result<bool> {
+        if *role == MetadataPath::root() {
+            return Err(Error::invalid(
+                "root must be signed offline: a key CI can reach could replace every other \
+                 role's keys unopposed",
+            ));
+        }
         if uri.is_empty() {
             return Err(Error::invalid(
                 "an online key needs a signing URI for CI to reach it",
             ));
         }
-        timestamp.validate(&MetadataPath::timestamp())?;
-        snapshot.validate(&MetadataPath::snapshot())?;
+        periods.validate(role)?;
         let key_id = key.key_id().clone();
 
-        self.edit_root(|root| {
-            for (role, periods) in [
-                (MetadataPath::timestamp(), timestamp),
-                (MetadataPath::snapshot(), snapshot),
-            ] {
-                let entry = root.role_mut(&role)?;
-                entry.keyids = BTreeSet::from([key_id.clone()]);
-                entry.threshold = 1;
-                root.policy.set_periods(&role, periods);
-            }
-            root.policy.online.insert(key_id.clone(), uri.to_owned());
-            root.keys.insert(key_id.clone(), key.clone());
-            Ok(())
-        })
+        // An automated role has nobody to invite and nothing pending: whatever the role was
+        // waiting on stops mattering the moment its key arrives.
+        let before = self.current.event.clone();
+        let mut event = before.clone();
+        event.remove_role(role);
+        let event_changed = event != before;
+        if event_changed {
+            self.current.event = event;
+            self.state_dirty = true;
+        }
+
+        let created = self.ensure_targets_exists(role)?;
+        let applied = self.edit_delegation(role, |parts| {
+            parts.authorize_online(key.clone(), uri);
+            parts.set_quorum(role, BTreeSet::from([key_id.clone()]), 1, periods)
+        })?;
+
+        Ok(applied || created || event_changed)
     }
 
     /// Contribute `user`'s key in response to an invitation.
@@ -1279,6 +1346,22 @@ impl DelegatorParts<'_> {
             }
         }
         Ok(())
+    }
+
+    /// Permit an automated key to sign, and record where CI reaches it.
+    ///
+    /// The key is removed from the roster of people's keys if it was ever listed there. A
+    /// key is one or the other: recorded as both, nothing can say whether the role it signs
+    /// waits for a signing event or for the next publish.
+    fn authorize_online(&mut self, key: PublicKey, uri: &str) {
+        let key_id = key.key_id().clone();
+        let (keys, policy) = match self {
+            DelegatorParts::Root(root) => (&mut root.keys, &mut root.policy),
+            DelegatorParts::Targets(targets) => (&mut targets.keys, &mut targets.policy),
+        };
+        keys.insert(key_id.clone(), key);
+        policy.signers.remove(&key_id);
+        policy.online.insert(key_id, uri.to_owned());
     }
 
     /// Set exactly who may sign `role`, how many of them are needed, and for how long.

@@ -121,9 +121,11 @@ fn repository() -> Repo {
     event
         .initialize(periods(), key_of("@alice"), "@alice")
         .unwrap();
-    event
-        .configure_online(key_of("online"), ONLINE_URI, periods(), periods())
-        .unwrap();
+    for role in [RoleName::snapshot(), RoleName::timestamp()] {
+        event
+            .configure_online_role(&role, key_of("online"), ONLINE_URI, periods())
+            .unwrap();
+    }
     event
         .configure_role(&crates, &config(&["@alice"], 1))
         .unwrap();

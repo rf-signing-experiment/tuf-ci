@@ -159,9 +159,11 @@ fn bootstrap(repo: &Repo, signers: &[&str], threshold: u32) {
             creator,
         )
         .expect("initialize");
-    event
-        .configure_online(online_key(), ONLINE_URI, periods(), periods())
-        .expect("configure online roles");
+    for role in [RoleName::snapshot(), RoleName::timestamp()] {
+        event
+            .configure_online_role(&role, online_key(), ONLINE_URI, periods())
+            .expect("configure online roles");
+    }
     event
         .configure_role(&RoleName::root(), &config(signers, threshold))
         .expect("configure root");

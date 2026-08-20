@@ -190,6 +190,8 @@ pub fn role_state(role: &RoleStatus) -> &'static str {
         "❌ invalid"
     } else if !role.blocking_invites.is_empty() {
         "✉️ awaiting keys"
+    } else if role.online {
+        "🤖 signed on publish"
     } else if role.is_complete() {
         "✅ signed"
     } else {
@@ -199,6 +201,11 @@ pub fn role_state(role: &RoleStatus) -> &'static str {
 
 /// The signature count for one role, showing both thresholds where root has two.
 pub fn signature_count(role: &RoleStatus) -> String {
+    // An online role's count would be a countdown to something no reader can act on: the
+    // key belongs to CI, and it signs when the repository is published.
+    if role.online {
+        return "automated".to_owned();
+    }
     let current = format!("{}/{}", role.tally.signed.len(), role.tally.threshold);
     match &role.previous_tally {
         // Root has to satisfy the outgoing key set as well as the incoming one, so one
@@ -315,7 +322,21 @@ mod tests {
             artifacts: Vec::new(),
             delegations: Vec::new(),
             problems: Vec::new(),
+            online: false,
         }
+    }
+
+    #[test]
+    fn an_online_role_reports_who_will_sign_it_rather_than_a_countdown() {
+        let mut role = role(&[], &["@alice"], 1);
+        role.online = true;
+
+        assert_eq!(signature_count(&role), "automated");
+        assert_eq!(role_state(&role), "🤖 signed on publish");
+        assert!(role.waiting_on().is_empty());
+        assert_eq!(role.outstanding(), 0);
+        // Complete despite holding no signatures: the key that signs it belongs to CI.
+        assert!(role.is_complete());
     }
 
     #[test]

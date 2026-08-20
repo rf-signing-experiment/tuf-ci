@@ -1,8 +1,4 @@
 //! The bits of the GitHub API this tool uses.
-//!
-//! Four endpoints, hand-rolled over a blocking HTTP client, rather than a full API binding:
-//! the CI binary is downloaded and run on every push to a signing event branch, so its size
-//! and start-up time are worth something, and this is not a moving target.
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;

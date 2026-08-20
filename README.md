@@ -270,8 +270,24 @@ raising a threshold to two before the second signer has a key, waits in
 `.signing-event.json` and lands the moment the last invitation is accepted. So a branch
 never holds metadata that a client, or this tool, would refuse to parse.
 
-`snapshot` and `timestamp` are signed by an automated key and never take part in a signing
-event; a branch that changes them is reported as an error.
+A role is signed by automation when the keys it names are keys the repository records a
+signing URI for, under `online` in the block above. That is the whole definition — nothing
+keys off a role's name, and every role is configured the same way: `tuf-sign delegate`
+asks who signs it, people or a key CI can reach, and either answer replaces the other. So
+`snapshot` and `timestamp` are automated because somebody said so during setup, a channel
+releasing nightly can be handed to automation when it starts and taken back when it stops,
+and nothing is special-cased. A role signed by automation takes no part in signing events:
+it is reported as `automated` rather than as a signature count, it never holds a pull
+request open, and a branch that edits its metadata is an error.
+
+The delegation is the whole of an online key's authority. It may sign that one role's
+metadata, over the artifact paths the delegation already names, and nothing else — it
+cannot widen its own reach, touch another role, or change who may sign. Root is the one
+role that may never be automated — it is the trust anchor, and a key CI can reach could
+replace every other role's keys unopposed. A key is one thing or the other, so handing a
+person's key to automation takes it off the roster of people's keys rather than listing it
+twice, and metadata that arrived from elsewhere naming a key as both, or mixing the two
+kinds in one role, is reported rather than guessed at.
 
 ## Differences from tuf-on-ci
 
@@ -292,7 +308,9 @@ event; a branch that changes them is reported as an error.
 The repository can be administered and published, but nothing yet produces the online
 roles a publish needs, or uploads the result. Still to come:
 
-- **online signing** — snapshot and timestamp signed with a KMS key when an event merges;
+- **online signing** — the KMS signer itself, and the CI step that re-signs every online
+  role and publishes; the metadata already records which roles those are and where to reach
+  their keys;
 - **scheduled expiry events** — the cron job that opens `sign/<role>-vN` when a role enters
   its signing period;
 - **uploading** — an S3 `Sink`, and the workflow that runs it on a merge to `main`.

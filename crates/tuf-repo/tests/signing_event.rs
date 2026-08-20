@@ -144,9 +144,11 @@ fn bootstrap(repo: &mut Repo, signers: &[&str], threshold: u32) {
             creator,
         )
         .expect("initialize");
-    event
-        .configure_online(online_key(), ONLINE_URI, periods(), periods())
-        .expect("configure online roles");
+    for role in [RoleName::snapshot(), RoleName::timestamp()] {
+        event
+            .configure_online_role(&role, online_key(), ONLINE_URI, periods())
+            .expect("configure online roles");
+    }
     event
         .configure_role(&RoleName::root(), &config(signers, threshold))
         .expect("configure root");
@@ -196,9 +198,11 @@ fn a_new_repository_needs_an_invitation_accepted_before_it_can_be_signed() {
     // has no keys for is not valid metadata, so there is no keyless state to start from.
     let alice_key = MemorySigner::for_owner("@alice").public_key().clone();
     event.initialize(periods(), alice_key, "@alice").unwrap();
-    event
-        .configure_online(online_key(), ONLINE_URI, periods(), periods())
-        .unwrap();
+    for role in [RoleName::snapshot(), RoleName::timestamp()] {
+        event
+            .configure_online_role(&role, online_key(), ONLINE_URI, periods())
+            .unwrap();
+    }
 
     // Opening root up to a second signer at threshold two cannot be written yet: @bob has
     // no key. The intent waits, and the event is not mergeable while it does.
@@ -387,9 +391,11 @@ fn several_changes_in_one_event_still_produce_one_new_version() {
     event
         .configure_role(&RoleName::root(), &config(&["@alice"], 1))
         .unwrap();
-    event
-        .configure_online(online_key(), ONLINE_URI, periods(), periods())
-        .unwrap();
+    for role in [RoleName::snapshot(), RoleName::timestamp()] {
+        event
+            .configure_online_role(&role, online_key(), ONLINE_URI, periods())
+            .unwrap();
+    }
     event
         .configure_role(
             &RoleName::root(),
@@ -620,6 +626,267 @@ fn changing_an_artifact_is_reported_as_a_modification() {
     );
 }
 
+/// Where CI would reach the key that signs a nightly channel.
+const NIGHTLY_URI: &str =
+    "gcpkms:projects/example/locations/global/keyRings/tuf/cryptoKeys/nightly";
+
+#[test]
+fn a_role_is_online_because_of_its_keys_not_because_of_its_name() {
+    let repo = Repo::new();
+    let mut event = repo.event();
+    let alice = MemorySigner::for_owner("@alice").public_key().clone();
+    event.initialize(periods(), alice, "@alice").unwrap();
+
+    // Fresh out of `initialize`, snapshot is held by the creator's key like every other
+    // role. Nothing about being called "snapshot" makes it automated.
+    assert!(!event.is_online(&RoleName::snapshot()));
+    assert!(event.online_roles().is_empty());
+
+    for role in [RoleName::snapshot(), RoleName::timestamp()] {
+        event
+            .configure_online_role(&role, online_key(), ONLINE_URI, periods())
+            .unwrap();
+    }
+
+    // Now it is, because the repository records a signing URI for the key that signs it.
+    assert!(event.is_online(&RoleName::snapshot()));
+    assert!(event.is_online(&RoleName::timestamp()));
+    assert!(!event.is_online(&RoleName::root()));
+    assert!(!event.is_online(&RoleName::targets()));
+    assert_eq!(
+        event.online_roles(),
+        [RoleName::snapshot(), RoleName::timestamp()]
+    );
+}
+
+#[test]
+fn a_delegated_role_can_be_handed_to_an_online_key() {
+    let mut repo = Repo::new();
+    bootstrap(&mut repo, &["@alice"], 1);
+
+    let nightly: RoleName = policy::role_name("nightly").unwrap();
+    let nightly_key = MemorySigner::for_owner("nightly").public_key().clone();
+
+    let mut event = repo.event();
+    assert!(
+        event
+            .configure_online_role(&nightly, nightly_key, NIGHTLY_URI, periods())
+            .unwrap()
+    );
+
+    // Online on the same terms as snapshot: a URI is recorded for the key that signs it.
+    assert!(event.is_online(&nightly));
+    assert!(event.online_roles().contains(&nightly));
+
+    // So nobody is invited and nobody is waiting. The people still sign the delegation —
+    // targets changed — but not the role it points at.
+    assert!(event.open_invitations().is_empty());
+    let status = event.role_status(&nightly);
+    assert!(status.online);
+    assert!(status.waiting_on().is_empty());
+    assert_eq!(status.outstanding(), 0);
+    assert!(status.is_complete(), "{status:#?}");
+
+    let mut alice = MemorySigner::for_owner("@alice");
+    event.sign(&RoleName::targets(), &mut alice).unwrap();
+    assert!(event.status().is_mergeable(), "{:#?}", event.status());
+    repo.merge(&event);
+
+    // Once it exists, a signing event may not touch it: the key that signs it is CI's.
+    let mut files = Files::default();
+    let payload = repo.main.0.get("metadata/nightly.json").unwrap();
+    let mut json: serde_json::Value = serde_json::from_slice(payload).unwrap();
+    json["version"] = serde_json::json!(9);
+    files.0.insert(
+        "metadata/nightly.json".into(),
+        serde_json::to_vec_pretty(&json).unwrap(),
+    );
+
+    let status = repo.event_with(&files).status();
+    assert!(
+        status
+            .problems
+            .iter()
+            .any(|problem| problem.contains("nightly") && problem.contains("signed online")),
+        "{status:#?}"
+    );
+    assert!(!status.is_mergeable());
+}
+
+#[test]
+fn a_role_can_move_between_people_and_an_automated_key() {
+    let mut repo = Repo::new();
+    bootstrap(&mut repo, &["@alice"], 1);
+
+    let nightly: RoleName = policy::role_name("nightly").unwrap();
+    let alice_key = MemorySigner::for_owner("@alice").public_key().clone();
+    let mut event = repo.event();
+
+    // Start with a person signing it.
+    event
+        .configure_role(&nightly, &config(&["@alice"], 1))
+        .unwrap();
+    event
+        .accept_invite(&nightly, "@alice", alice_key.clone())
+        .unwrap();
+    assert!(!event.is_online(&nightly));
+
+    // Hand it to automation. The person's key stops being trusted for it.
+    event
+        .configure_online_role(
+            &nightly,
+            MemorySigner::for_owner("nightly").public_key().clone(),
+            NIGHTLY_URI,
+            periods(),
+        )
+        .unwrap();
+    assert!(event.is_online(&nightly));
+
+    // And hand it back. Naming people again is the whole of it — though as for any
+    // delegation, they have to contribute a key before it can be written, so the role
+    // stays automated until the invitation is answered.
+    event
+        .configure_role(&nightly, &config(&["@alice"], 1))
+        .unwrap();
+    assert!(
+        event.is_online(&nightly),
+        "a configuration nobody has a key for cannot be written yet"
+    );
+    event.accept_invite(&nightly, "@alice", alice_key).unwrap();
+
+    assert!(!event.is_online(&nightly));
+    let delegator = event.current().delegator_of(&nightly).unwrap();
+    assert!(
+        delegator.policy().online.is_empty(),
+        "the URI should go with the key that is no longer trusted: {:#?}",
+        delegator.policy()
+    );
+}
+
+#[test]
+fn root_is_the_one_role_that_cannot_be_handed_to_an_online_key() {
+    let mut repo = Repo::new();
+    bootstrap(&mut repo, &["@alice"], 1);
+    let key = MemorySigner::for_owner("automation").public_key().clone();
+    let mut event = repo.event();
+
+    let err = event
+        .configure_online_role(&RoleName::root(), key.clone(), NIGHTLY_URI, periods())
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("must be signed offline"), "{err}");
+
+    // Every other role is the operator's choice, including the top-level targets role.
+    for role in [
+        RoleName::targets(),
+        RoleName::snapshot(),
+        RoleName::timestamp(),
+        policy::role_name("nightly").unwrap(),
+    ] {
+        event
+            .configure_online_role(&role, key.clone(), NIGHTLY_URI, periods())
+            .unwrap_or_else(|err| panic!("{role}: {err}"));
+        assert!(event.is_online(&role), "{role}");
+    }
+
+    // A signing URI is the whole of what makes a key online, so there is no such thing as
+    // an online key without one.
+    let err = event
+        .configure_online_role(&RoleName::snapshot(), key, "", periods())
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("signing URI"), "{err}");
+}
+
+#[test]
+fn handing_a_persons_key_to_automation_moves_it_rather_than_sharing_it() {
+    let mut repo = Repo::new();
+    bootstrap(&mut repo, &["@alice"], 1);
+
+    // Give snapshot the key Alice already signs root with. A key is one thing or the
+    // other, so it stops being recorded as hers — which leaves root signed by a key CI
+    // can reach, and that is the fault worth reporting.
+    let mut event = repo.event();
+    event
+        .configure_online_role(
+            &RoleName::snapshot(),
+            MemorySigner::for_owner("@alice").public_key().clone(),
+            ONLINE_URI,
+            periods(),
+        )
+        .unwrap();
+
+    let delegator = event.current().delegator_of(&RoleName::root()).unwrap();
+    assert!(
+        delegator.policy().signers.is_empty(),
+        "the key moved to the online roster: {:#?}",
+        delegator.policy()
+    );
+
+    let problems = event.role_status(&RoleName::root()).problems.join("\n");
+    assert!(problems.contains("must be signed offline"), "{problems}");
+}
+
+#[test]
+fn a_key_recorded_as_both_a_persons_and_an_online_signers_is_reported() {
+    let mut repo = Repo::new();
+    bootstrap(&mut repo, &["@alice"], 1);
+
+    // No API produces this — handing a key to automation takes it off the roster of
+    // people's keys. It checks the guard against metadata that arrived from somewhere
+    // else: Alice's key listed in both places at once.
+    let alice = MemorySigner::for_owner("@alice");
+    let mut files = Files::default();
+    let payload = repo.main.0.get("metadata/root.json").unwrap();
+    let mut json: serde_json::Value = serde_json::from_slice(payload).unwrap();
+    json["x-tuf-ci"]["online"] =
+        serde_json::json!({ alice.key_id().as_str(): "gcpkms:projects/example/keys/whoops" });
+    files.0.insert(
+        "metadata/root.json".into(),
+        serde_json::to_vec_pretty(&json).unwrap(),
+    );
+
+    let problems = repo
+        .event_with(&files)
+        .role_status(&RoleName::root())
+        .problems
+        .join("\n");
+    assert!(
+        problems.contains("both as a person's key and as an online key"),
+        "{problems}"
+    );
+}
+
+#[test]
+fn a_role_mixing_an_online_key_with_a_persons_is_reported() {
+    let mut repo = Repo::new();
+    bootstrap(&mut repo, &["@alice"], 1);
+
+    // No API produces this, because handing a role to an online key replaces its key set
+    // outright. It checks the guard against metadata that arrived from somewhere else:
+    // root keeping Alice's key while gaining the online one.
+    let mut files = Files::default();
+    let payload = repo.main.0.get("metadata/root.json").unwrap();
+    let mut json: serde_json::Value = serde_json::from_slice(payload).unwrap();
+    let online = online_key().key_id().as_str().to_owned();
+    json["roles"]["root"]["keyids"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!(online));
+    files.0.insert(
+        "metadata/root.json".into(),
+        serde_json::to_vec_pretty(&json).unwrap(),
+    );
+
+    let event = repo.event_with(&files);
+    assert!(
+        !event.is_online(&RoleName::root()),
+        "a partly-online role is a mistake, not a third kind of role"
+    );
+    let problems = event.role_status(&RoleName::root()).problems.join("\n");
+    assert!(problems.contains("mixes an online key"), "{problems}");
+}
+
 #[test]
 fn a_signing_event_that_touches_online_metadata_is_refused() {
     let mut repo = Repo::new();
@@ -750,16 +1017,16 @@ fn a_key_id_that_does_not_name_its_own_key_is_rejected() {
 }
 
 #[test]
-fn snapshot_and_timestamp_must_share_a_signer() {
+fn snapshot_and_timestamp_need_not_share_a_signer() {
     let mut repo = Repo::new();
     bootstrap(&mut repo, &["@alice"], 1);
 
+    // Timestamp handed to a person's key while snapshot keeps the automated one. Odd —
+    // timestamp is the role that expires soonest and so is re-signed most often — but it
+    // is the operator's call, and TUF has no rule against it.
+    let alice = MemorySigner::for_owner("@alice");
     let mut json: serde_json::Value =
         serde_json::from_slice(repo.main.0.get("metadata/root.json").unwrap()).unwrap();
-    // Valid metadata that still breaks the rule: timestamp handed to a human's key while
-    // snapshot keeps the online one. Nothing in TUF forbids it; this project does, because
-    // one automated signer produces both.
-    let alice = MemorySigner::for_owner("@alice");
     json["version"] = serde_json::json!(2);
     json["roles"]["timestamp"]["keyids"] = serde_json::json!([alice.key_id().as_str()]);
     let mut files = Files::default();
@@ -770,13 +1037,12 @@ fn snapshot_and_timestamp_must_share_a_signer() {
 
     let event = repo.event_with(&files);
     let status = event.role_status(&RoleName::root());
-    assert!(
-        status
-            .problems
-            .iter()
-            .any(|problem| problem.contains("same keys")),
-        "{status:#?}"
-    );
+    assert!(status.problems.is_empty(), "{status:#?}");
+
+    // Each is read as what its own key says it is.
+    assert!(event.is_online(&RoleName::snapshot()));
+    assert!(!event.is_online(&RoleName::timestamp()));
+    assert_eq!(event.online_roles(), [RoleName::snapshot()]);
 }
 
 #[test]

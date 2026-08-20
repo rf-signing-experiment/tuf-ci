@@ -68,14 +68,6 @@ pub fn role_name(name: &str) -> Result<MetadataPath> {
     MetadataPath::new(name.to_owned()).map_err(|err| Error::invalid(err.to_string()))
 }
 
-/// Whether `role` is signed by an automated key rather than by people.
-///
-/// Online roles are re-signed on every publish, so they never take part in a signing event
-/// and a change to one inside an event is an error.
-pub fn is_online(role: &MetadataPath) -> bool {
-    matches!(role.as_str(), "snapshot" | "timestamp")
-}
-
 /// Whether `role` is one of the four the root role delegates to directly.
 pub fn is_top_level(role: &MetadataPath) -> bool {
     matches!(role.as_str(), "root" | "targets" | "snapshot" | "timestamp")
@@ -83,7 +75,7 @@ pub fn is_top_level(role: &MetadataPath) -> bool {
 
 /// Whether `role` is a targets role: anything but `root`, `snapshot` and `timestamp`.
 pub fn is_targets(role: &MetadataPath) -> bool {
-    !is_online(role) && role.as_str() != "root"
+    !matches!(role.as_str(), "root" | "snapshot" | "timestamp")
 }
 
 // ---------------------------------------------------------------------------
@@ -184,6 +176,18 @@ impl Policy {
         }
         extra.insert(POLICY_FIELD.to_owned(), serde_json::to_value(self)?);
         Ok(())
+    }
+
+    /// Whether `key_id` is one an automated signer holds.
+    ///
+    /// This is where "online" is recorded, and the only place it is decided. A role is
+    /// signed by automation because the keys it names are keys this repository has a
+    /// signing URI for — not because of what the role is called. Keeping it here means the
+    /// answer travels with the metadata, inside the block the delegating role's signers
+    /// attest to, so the signing tool and CI cannot come to different conclusions about
+    /// who is supposed to sign what.
+    pub fn is_online_key(&self, key_id: &KeyId) -> bool {
+        self.online.contains_key(key_id)
     }
 
     /// Who or what signs with `key_id`: an `@handle`, an online signer's URI, or neither.
@@ -348,13 +352,26 @@ mod tests {
 
     #[test]
     fn role_classification() {
-        assert!(is_online(&MetadataPath::snapshot()));
-        assert!(is_online(&MetadataPath::timestamp()));
-        assert!(!is_online(&MetadataPath::root()));
         assert!(is_targets(&MetadataPath::targets()));
         assert!(is_targets(&role_name("crates").unwrap()));
         assert!(!is_targets(&MetadataPath::root()));
+        assert!(!is_targets(&MetadataPath::snapshot()));
+        assert!(!is_targets(&MetadataPath::timestamp()));
+        assert!(is_top_level(&MetadataPath::snapshot()));
         assert!(!is_top_level(&role_name("crates").unwrap()));
+    }
+
+    #[test]
+    fn a_key_is_online_because_it_has_a_signing_uri() {
+        let key_id: KeyId = "abc123".parse().unwrap();
+        let mut policy = Policy::default();
+        assert!(!policy.is_online_key(&key_id));
+
+        policy.online.insert(key_id.clone(), "gcpkms:…".into());
+        assert!(policy.is_online_key(&key_id));
+
+        // Nothing about the name of a role, or of a key, comes into it.
+        assert!(!policy.is_online_key(&"def456".parse().unwrap()));
     }
 
     #[test]
