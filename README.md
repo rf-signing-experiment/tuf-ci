@@ -19,11 +19,6 @@ actions/
 template/        a TUF repository, ready to be copied
 ```
 
-`template/` is a starting point for the repository being administered, not part of this
-one. Its workflows sit under `template/.github/workflows/`, which GitHub Actions does not
-read — only the `.github/workflows/` at a repository root runs — so they are inert here
-and live the moment the folder is copied to a repository of its own.
-
 ## Repository layout
 
 ```
@@ -94,9 +89,6 @@ Your YubiKey needs an ECDSA P-256 key in PIV slot 9c:
 $ ykman piv keys generate --algorithm ECCP256 --touch-policy cached 9c public.pem
 ```
 
-No PKCS#11 module and no certificate in the slot are required — the public key is read
-directly from slot metadata.
-
 ### As a repository
 
 A TUF repository is its own repository, separate from this one. This repository holds the
@@ -117,35 +109,9 @@ workflow will push successfully and then do nothing at all.
 3. Create the GitHub App, **install it on the new repository**, and add
    `TUF_CI_APP_CLIENT_ID` and `TUF_CI_APP_PRIVATE_KEY`.
 4. Push all of that to `main`.
-5. Only now run `tuf-sign init sign/init` — whoever runs it becomes the repository's first
-   signer, so it needs a YubiKey to hand.
+5. Only now run `tuf-sign init sign/init`
 
-```yaml
-# <your-tuf-repo>/.github/workflows/signing-event.yml
-name: TUF signing event
-on:
-  push:
-    branches: ['sign/**']
-
-permissions: {}   # the App token carries its own
-
-jobs:
-  signing-event:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/create-github-app-token@v3   # pin by commit SHA
-        id: app-token
-        with:
-          client-id: ${{ vars.TUF_CI_APP_CLIENT_ID }}
-          private-key: ${{ secrets.TUF_CI_APP_PRIVATE_KEY }}
-
-      - uses: rf-signing-experiment/tuf-ci/actions/signing-event@<commit-sha>
-        with:
-          token: ${{ steps.app-token.outputs.token }}
-          app-slug: ${{ steps.app-token.outputs.app-slug }}
-```
-
-Require the `tuf-ci/signatures` check in branch protection on `main`, and a signing event
+Require the `tuf-ci/signatures` check in branch protection on `main` so a signing event
 cannot be merged until it has reached its thresholds.
 
 ### The GitHub App

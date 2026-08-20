@@ -234,14 +234,14 @@ pub fn describe_delegation(change: &DelegationChange) -> String {
     match (&change.current, &change.previous) {
         (Some(current), None) => {
             format!(
-                "new delegation `{}`, signed by {}",
+                "new delegation `{}`, threshold {}",
                 change.role,
                 describe(current)
             )
         }
         (None, Some(_)) => format!("delegation `{}` removed", change.role),
         (Some(current), Some(previous)) => format!(
-            "delegation `{}` now signed by {} (was {})",
+            "delegation `{}` now threshold {} (was {})",
             change.role,
             describe(current),
             describe(previous)
