@@ -17,10 +17,12 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
+use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
 use tuf_repo::event::{EventStatus, SigningEvent};
+use tuf_repo::publish::{FsSink, Plan};
 use tuf_repo::report;
-use tuf_repo::store::{EmptySource, FsSource, GitSource, RepoState, Writer};
+use tuf_repo::store::{EmptySource, FsSource, GitSource, RepoState, Source, Writer};
 
 use crate::github::{Conclusion, GitHub};
 
@@ -65,6 +67,34 @@ enum Action {
         #[arg(long)]
         no_create: bool,
     },
+    /// Build the repository a client fetches from the signed metadata.
+    ///
+    /// Signs nothing and dates nothing: every byte written is either a document already
+    /// signed in the repository or an artifact those documents describe. Run against the
+    /// same commit twice and the output is identical, which is how somebody holding no
+    /// keys can check that what is live is what was signed.
+    ///
+    /// Only files `--out` does not already hold are written, so pointing it at the
+    /// previous publish and uploading what changed is the cheap path.
+    ///
+    /// Exits 0 if anything was written, 1 if the repository was already published.
+    Publish {
+        /// Where to write the published repository.
+        #[arg(long)]
+        out: PathBuf,
+
+        /// Publish this commit rather than the working tree.
+        #[arg(long)]
+        rev: Option<String>,
+
+        /// Write the list of published files and their digests here; `-` for stdout.
+        #[arg(long)]
+        manifest: Option<PathBuf>,
+
+        /// Judge expiry as of this time rather than now, to reproduce an earlier publish.
+        #[arg(long, value_name = "RFC3339")]
+        as_of: Option<DateTime<Utc>>,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -92,12 +122,20 @@ fn run() -> Result<bool> {
         Some(path) => path,
         None => std::env::current_dir().context("could not read the current directory")?,
     };
-    let context = EventContext::discover(&repo, &cli.base_branch)?;
+    // Publishing is about the repository, not about a signing event, so it neither needs
+    // nor looks for a branch to compare against.
+    let event = || EventContext::discover(&repo, &cli.base_branch);
 
     match cli.command {
-        Action::UpdateTargets { push } => update_targets(&context, push),
-        Action::Status { format } => status(&context, format),
-        Action::PrUpdate { no_create } => pr_update(&context, no_create),
+        Action::UpdateTargets { push } => update_targets(&event()?, push),
+        Action::Status { format } => status(&event()?, format),
+        Action::PrUpdate { no_create } => pr_update(&event()?, no_create),
+        Action::Publish {
+            out,
+            rev,
+            manifest,
+            as_of,
+        } => publish(&repo, &out, rev.as_deref(), manifest.as_deref(), as_of),
     }
 }
 
@@ -343,6 +381,55 @@ fn pr_update(context: &EventContext, no_create: bool) -> Result<bool> {
 }
 
 /// The status in a form another tool can read.
+/// Build the files a client fetches, and write the ones that are not already there.
+fn publish(
+    repo: &Path,
+    out: &Path,
+    rev: Option<&str>,
+    manifest: Option<&Path>,
+    as_of: Option<DateTime<Utc>>,
+) -> Result<bool> {
+    let source: Box<dyn Source> = match rev {
+        Some(rev) => Box::new(GitSource::new(repo, rev)),
+        None => Box::new(FsSource::new(repo)),
+    };
+    let as_of = as_of.unwrap_or_else(Utc::now);
+
+    // Everything is verified the way a client verifies it before anything is written, so a
+    // repository that would not satisfy a client never reaches the output directory.
+    let plan =
+        Plan::build(source.as_ref(), as_of).context("this repository cannot be published")?;
+
+    let mut sink = FsSink::new(out);
+    let report = plan
+        .write(source.as_ref(), &mut sink)
+        .context("writing the published repository")?;
+
+    if let Some(path) = manifest {
+        let bytes = tuf_repo::ser::to_bytes(&plan.manifest())?;
+        if path == Path::new("-") {
+            std::io::Write::write_all(&mut std::io::stdout(), &bytes)
+                .context("writing the manifest")?;
+        } else {
+            std::fs::write(path, bytes).with_context(|| format!("writing {}", path.display()))?;
+        }
+    }
+
+    // What happened goes to stderr, so that `--manifest -` leaves stdout to the manifest.
+    for path in &report.written {
+        eprintln!("+ {path}");
+    }
+    eprintln!(
+        "{} of {} files written ({} bytes) to {}",
+        report.written.len(),
+        report.written.len() + report.unchanged.len(),
+        report.bytes,
+        out.display()
+    );
+
+    Ok(report.changed())
+}
+
 fn summarize(status: &EventStatus) -> serde_json::Value {
     serde_json::json!({
         "mergeable": status.is_mergeable(),

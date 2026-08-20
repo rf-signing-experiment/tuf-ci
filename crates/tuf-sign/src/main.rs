@@ -500,18 +500,6 @@ fn finish(
     checkout.push(&config.git.push_remote, &refs.name, config.signs_via_fork())?;
     ui::success(&format!("Pushed to {destination}"));
 
-    if !checkout.has_signing_event_workflow() {
-        ui::warn(
-            "This branch carries no signing event workflow, so CI will not report on it \
-             and no pull request will be opened.",
-        );
-        ui::info(
-            "  A push event runs the workflow as it exists in the pushed commit, not the \
-             one on the base branch, so the workflow has to be committed to the base \
-             branch before an event branches off it.",
-        );
-    }
-
     if config.signs_via_fork() {
         let upstream = session.git.github_repo(&config.git.pull_remote)?;
         let fork = session.git.github_repo(&config.git.push_remote)?;

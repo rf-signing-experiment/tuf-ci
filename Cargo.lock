@@ -2093,9 +2093,11 @@ dependencies = [
  "anyhow",
  "chrono",
  "clap",
+ "hex",
  "serde",
  "serde_json",
  "tempfile",
+ "tuf",
  "tuf-repo",
  "ureq",
 ]

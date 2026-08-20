@@ -1101,7 +1101,7 @@ impl RepoState {
             let Some(raw) = source.read(&path)? else {
                 continue;
             };
-            let signatures = read_signatures(source, &role)?;
+            let signatures = read_signatures(source, &signature_path(&role))?;
 
             if role == MetadataPath::root() {
                 state.root = Some(Signed::parse(raw, signatures)?);
@@ -1221,8 +1221,8 @@ fn role_of_metadata_path(path: &str) -> Option<MetadataPath> {
     policy::role_name(stem).ok()
 }
 
-fn read_signatures(source: &dyn Source, role: &MetadataPath) -> Result<Vec<Signature>> {
-    match source.read(&signature_path(role))? {
+fn read_signatures(source: &dyn Source, path: &str) -> Result<Vec<Signature>> {
+    match source.read(path)? {
         Some(raw) => serde_json::from_slice::<SignatureFile>(&raw)?
             .signatures
             .into_iter()
@@ -1230,6 +1230,63 @@ fn read_signatures(source: &dyn Source, role: &MetadataPath) -> Result<Vec<Signa
             .collect(),
         None => Ok(Vec::new()),
     }
+}
+
+/// Read a payload file and the signature file beside it, if the payload is there.
+///
+/// Both paths are given rather than derived from a role, because the same document is
+/// filed under two different names: `metadata/root.json` while it is current, and
+/// `metadata/root_history/3.root.json` for good.
+pub fn read_signed<M: Metadata + ExtraFields + Clone>(
+    source: &dyn Source,
+    payload: &str,
+    signatures: &str,
+) -> Result<Option<Signed<M>>> {
+    let Some(raw) = source.read(payload)? else {
+        return Ok(None);
+    };
+    Ok(Some(Signed::parse(
+        raw,
+        read_signatures(source, signatures)?,
+    )?))
+}
+
+/// Every archived root version, by version number.
+///
+/// A client that has not looked since root version 2 reaches version 5 by verifying 3,
+/// then 4, then 5, each against the one before it. So publishing a repository means
+/// publishing every root that has ever been signed, not only the current one.
+pub fn read_root_history(source: &dyn Source) -> Result<BTreeMap<u32, Signed<RootMetadata>>> {
+    let mut history = BTreeMap::new();
+
+    for path in source.list(ROOT_HISTORY_DIR)? {
+        let Some(version) = root_history_version(&path) else {
+            continue;
+        };
+        let Some(signed) =
+            read_signed::<RootMetadata>(source, &path, &root_history_signature_path(version))?
+        else {
+            continue;
+        };
+        if signed.payload().version() != version {
+            return Err(Error::invalid(format!(
+                "{path} holds root version {}",
+                signed.payload().version()
+            )));
+        }
+        history.insert(version, signed);
+    }
+
+    Ok(history)
+}
+
+/// The root version an archived payload path names, or `None` if it names something else.
+fn root_history_version(path: &str) -> Option<u32> {
+    path.strip_prefix(ROOT_HISTORY_DIR)?
+        .strip_prefix('/')?
+        .strip_suffix(".root.json")?
+        .parse()
+        .ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -1326,6 +1383,28 @@ mod tests {
         assert_eq!(role("metadata/root_history/1.root.json"), None);
         assert_eq!(role("metadata/README.md"), None);
         assert_eq!(role("targets/root.json"), None);
+    }
+
+    #[test]
+    fn archived_root_paths_name_their_version() {
+        assert_eq!(
+            root_history_version("metadata/root_history/1.root.json"),
+            Some(1)
+        );
+        assert_eq!(
+            root_history_version("metadata/root_history/12.root.json"),
+            Some(12)
+        );
+        // The signature file sits beside the payload and is read through it, not listed.
+        assert_eq!(
+            root_history_version("metadata/root_history/1.root.sig.json"),
+            None
+        );
+        assert_eq!(root_history_version("metadata/root.json"), None);
+        assert_eq!(
+            root_history_version("metadata/root_history/README.md"),
+            None
+        );
     }
 
     #[test]

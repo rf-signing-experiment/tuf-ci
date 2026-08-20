@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 tuf-repo.workspace = true
 anyhow.workspace = true
+chrono.workspace = true
 clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -21,4 +22,6 @@ path = "src/main.rs"
 tuf-repo = { path = "../tuf-repo", features = ["testing"] }
 tempfile.workspace = true
 chrono.workspace = true
+hex.workspace = true
 serde_json.workspace = true
+tuf.workspace = true

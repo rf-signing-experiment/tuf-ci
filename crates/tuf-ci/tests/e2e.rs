@@ -10,12 +10,18 @@
 use std::path::Path;
 use std::process::{Command, Output};
 
-use chrono::{TimeZone, Utc};
+use chrono::{Duration, TimeZone, Utc};
+use tuf::crypto::HashAlgorithm;
+use tuf::metadata::{
+    Metadata, MetadataDescription, MetadataPath, SnapshotMetadataBuilder, TimestampMetadataBuilder,
+};
 use tuf_repo::crypto::PublicKey;
 use tuf_repo::event::{RoleConfig, SigningEvent};
 use tuf_repo::policy::{self, Periods, RoleName};
 use tuf_repo::signer::Signer as _;
-use tuf_repo::store::{EmptySource, FsSource, GitSource, RepoState, Writer};
+use tuf_repo::store::{
+    self, EmptySource, ExtraFields, FsSource, GitSource, RepoState, Signed, Writer,
+};
 use tuf_repo::testing::MemorySigner;
 
 // ---------------------------------------------------------------------------
@@ -190,6 +196,87 @@ fn bootstrap(repo: &Repo, signers: &[&str], threshold: u32) {
         event.status()
     );
     repo.persist(&event, "Create root and targets metadata");
+}
+
+/// Describe a published envelope, which is what a client downloads and hashes — not the
+/// payload file beside it.
+fn describe<M: Metadata>(bytes: &[u8], version: u32) -> MetadataDescription<M> {
+    MetadataDescription::from_slice(bytes, version, &[HashAlgorithm::Sha256]).unwrap()
+}
+
+/// Sign snapshot and timestamp with the online key, and commit them.
+///
+/// This is the step that runs when a signing event merges. It is not `tuf-ci`'s job yet,
+/// so the test does it directly; publishing needs it done because a client cannot use a
+/// repository without those two roles.
+fn online_sign(repo: &Repo) {
+    let state = RepoState::load(&FsSource::new(repo.path())).unwrap();
+    let mut online = MemorySigner::for_owner("online");
+    let now = Utc.with_ymd_and_hms(2026, 8, 12, 12, 0, 0).unwrap();
+
+    let mut builder = SnapshotMetadataBuilder::new()
+        .version(1)
+        .expires(now + Duration::days(7));
+    for (role, signed) in &state.targets {
+        builder = builder.insert_metadata_description(
+            role.clone(),
+            describe(&signed.envelope().unwrap(), signed.payload().version()),
+        );
+    }
+    let mut snapshot = Signed::new(builder.build().unwrap()).unwrap();
+    snapshot.sign_with(&mut online).unwrap();
+
+    let timestamp = TimestampMetadataBuilder::from_metadata_description(describe(
+        &snapshot.envelope().unwrap(),
+        snapshot.payload().version(),
+    ))
+    .version(1)
+    .expires(now + Duration::days(1))
+    .build()
+    .unwrap();
+    let mut timestamp = Signed::new(timestamp).unwrap();
+    timestamp.sign_with(&mut online).unwrap();
+
+    write_role(repo, &MetadataPath::snapshot(), &snapshot);
+    write_role(repo, &MetadataPath::timestamp(), &timestamp);
+    repo.git(&["add", "metadata"]);
+    repo.commit("Sign snapshot and timestamp");
+}
+
+fn write_role<M: Metadata + ExtraFields + Clone>(
+    repo: &Repo,
+    role: &MetadataPath,
+    signed: &Signed<M>,
+) {
+    repo.write(&store::payload_path(role), signed.raw());
+    repo.write(
+        &store::signature_path(role),
+        &signed.signature_file().unwrap(),
+    );
+}
+
+/// Every file in a published tree, by path, with its sha256.
+fn published(dir: &Path) -> std::collections::BTreeMap<String, String> {
+    let mut found = std::collections::BTreeMap::new();
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(next) = pending.pop() {
+        for entry in std::fs::read_dir(&next).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_dir() {
+                pending.push(entry.path());
+                continue;
+            }
+            let relative = entry
+                .path()
+                .strip_prefix(dir)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+            let bytes = std::fs::read(entry.path()).unwrap();
+            found.insert(relative, hex::encode(tuf_repo::crypto::sha256(&bytes)));
+        }
+    }
+    found
 }
 
 fn stdout(output: &Output) -> String {
@@ -466,4 +553,113 @@ fn tampering_with_a_signature_is_caught() {
         stdout(&status)
     );
     assert!(stdout(&status).contains("Waiting on 1 more signature."));
+}
+
+#[test]
+fn publishing_turns_the_signed_pairs_into_a_repository_a_client_can_fetch() {
+    let repo = Repo::new();
+    bootstrap(&repo, &["@alice"], 1);
+
+    // An artifact with bytes git must not touch: a NUL, and a line ending that a
+    // text-mode checkout would rewrite.
+    let artifact: &[u8] = b"binary\r\n\x00bytes\n";
+    repo.git(&["switch", "--quiet", "--create", "sign/add-artifact"]);
+    repo.write("targets/payload.bin", artifact);
+    repo.git(&["add", "targets"]);
+    repo.commit("Add an artifact");
+    assert_eq!(repo.tuf_ci(&["update-targets"]).status.code(), Some(0));
+
+    let mut event = repo.event();
+    let mut alice = MemorySigner::for_owner("@alice");
+    event.sign(&RoleName::targets(), &mut alice).unwrap();
+    repo.persist(&event, "Sign targets");
+    repo.git(&["switch", "--quiet", "main"]);
+    repo.git(&["merge", "--quiet", "--ff-only", "sign/add-artifact"]);
+    online_sign(&repo);
+
+    // A first publish writes everything and says so. `--as-of` is what an auditor
+    // reproducing an old publish passes, and what this test needs, since the harness
+    // signs at a fixed date and a timestamp is good for a day.
+    let out = repo.path().join("dist");
+    let published_at = "2026-08-12T12:00:00Z";
+    let first = repo.tuf_ci(&[
+        "publish",
+        "--out",
+        out.to_str().unwrap(),
+        "--as-of",
+        published_at,
+    ]);
+    assert_eq!(first.status.code(), Some(0), "{}", combined(&first));
+
+    let files = published(&out);
+    assert!(files.contains_key("metadata/timestamp.json"), "{files:#?}");
+    assert!(files.contains_key("metadata/1.root.json"), "{files:#?}");
+    assert!(files.contains_key("metadata/root.json"), "{files:#?}");
+
+    // The artifact is served under its own hash, byte for byte.
+    let digest = hex::encode(tuf_repo::crypto::sha256(artifact));
+    let published_artifact = out.join(format!("targets/{digest}.payload.bin"));
+    assert_eq!(std::fs::read(&published_artifact).unwrap(), artifact);
+
+    // Publishing again has nothing to do, and says so with exit 1 so a workflow can skip
+    // the upload.
+    let second = repo.tuf_ci(&[
+        "publish",
+        "--out",
+        out.to_str().unwrap(),
+        "--as-of",
+        published_at,
+    ]);
+    assert_eq!(second.status.code(), Some(1), "{}", combined(&second));
+    assert!(combined(&second).contains("0 of"), "{}", combined(&second));
+
+    // The auditor's path: publish the same commit again, from git rather than from the
+    // working tree, into an empty directory. Every file comes out identical.
+    let audit = repo.path().join("audit");
+    let output = repo.tuf_ci(&[
+        "publish",
+        "--rev",
+        "main",
+        "--out",
+        audit.to_str().unwrap(),
+        "--manifest",
+        "-",
+        "--as-of",
+        published_at,
+    ]);
+    assert_eq!(output.status.code(), Some(0), "{}", combined(&output));
+    assert_eq!(published(&audit), files);
+
+    // And the manifest it printed describes exactly those files.
+    let manifest: serde_json::Value = serde_json::from_str(&stdout(&output)).unwrap();
+    let listed: std::collections::BTreeMap<String, String> = manifest["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|file| {
+            (
+                file["path"].as_str().unwrap().to_owned(),
+                file["sha256"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect();
+    assert_eq!(listed, files);
+}
+
+#[test]
+fn a_repository_missing_its_online_roles_will_not_publish() {
+    let repo = Repo::new();
+    bootstrap(&repo, &["@alice"], 1);
+
+    let out = repo.path().join("dist");
+    let output = repo.tuf_ci(&["publish", "--out", out.to_str().unwrap()]);
+
+    // Exit 2 is "this did not work", as distinct from 1, which means "nothing to do".
+    assert_eq!(output.status.code(), Some(2), "{}", combined(&output));
+    assert!(
+        combined(&output).contains("online key"),
+        "{}",
+        combined(&output)
+    );
+    assert!(!out.exists(), "nothing should have been written");
 }

@@ -171,28 +171,6 @@ impl Checkout {
         Ok(true)
     }
 
-    /// Whether this branch carries a workflow that would report on the signing event.
-    ///
-    /// A `push` event runs the workflow as it exists in the pushed commit, so a branch
-    /// that took its history from a base branch without one will silently do nothing in
-    /// CI. That is invisible from the signer's side — the push succeeds either way — so it
-    /// is worth saying out loud.
-    pub fn has_signing_event_workflow(&self) -> bool {
-        let Ok(listing) = self.worktree.git().run(&[
-            "ls-tree",
-            "-r",
-            "--name-only",
-            "HEAD",
-            "--",
-            ".github/workflows",
-        ]) else {
-            return true; // Cannot tell; do not cry wolf.
-        };
-        listing
-            .lines()
-            .any(|path| path.ends_with(".yml") || path.ends_with(".yaml"))
-    }
-
     /// Push the event branch, to `remote` under `branch`.
     pub fn push(&self, remote: &str, branch: &str, force: bool) -> Result<()> {
         let refspec = format!("HEAD:refs/heads/{branch}");

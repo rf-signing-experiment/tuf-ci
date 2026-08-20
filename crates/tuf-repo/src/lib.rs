@@ -36,6 +36,7 @@ pub mod crypto;
 pub mod error;
 pub mod event;
 pub mod policy;
+pub mod publish;
 pub mod report;
 pub mod ser;
 pub mod signer;

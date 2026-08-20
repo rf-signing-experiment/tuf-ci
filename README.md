@@ -186,6 +186,71 @@ $ git add targets && git commit -m 'Add serde 1.0.0' && git push -u origin HEAD
 
 CI turns that into a targets metadata change, and the pull request says who has to sign it.
 
+## Publishing
+
+`tuf-ci publish` turns the pair of files each role is stored as into what a client fetches:
+one DSSE envelope per role, addressed by version, and every artifact addressed by its hash.
+
+```console
+$ tuf-ci publish --out dist
++ targets/db45b4f2….serde-1.0.0.crate
++ metadata/2.targets.json
++ metadata/2.snapshot.json
++ metadata/timestamp.json
+4 of 11 files written (18422 bytes) to dist
+```
+
+```
+dist/
+  metadata/1.root.json          every root that has ever been signed, so a client that
+  metadata/2.root.json            has been away can walk forward to the current one
+  metadata/root.json            the current root again, for a client with nowhere to start
+  metadata/2.targets.json
+  metadata/2.crates.json
+  metadata/2.snapshot.json
+  metadata/timestamp.json
+  targets/db45b4f2….serde-1.0.0.crate
+```
+
+It signs nothing and dates nothing. Every byte written is either a document already signed
+in git or an artifact those documents describe, so the output is a pure function of the
+commit — which is what makes it checkable. An auditor holding no keys runs
+
+```console
+$ tuf-ci publish --rev v3 --out /tmp/audit --manifest -
+```
+
+and compares the manifest against what is live. `--rev` reads the commit straight out of
+git, so there is nothing to check out and nothing local to trust.
+
+Before writing anything, the whole repository is replayed through the `tuf` crate's client
+verification: the root chain from its oldest version forward, then timestamp, snapshot,
+targets and each delegated role, each against the one that vouches for it. Artifacts are
+checked against the signed descriptions as they are read. A repository a client would
+reject does not get published.
+
+Publishing needs `snapshot` and `timestamp`, which are the online key's work and not yet
+implemented; until then, `publish` says so and stops.
+
+### Uploading it
+
+Every published name but two — `metadata/root.json` and `metadata/timestamp.json` — pins
+its own contents, by version number for metadata and by hash for artifacts. So a
+republish is cheap by construction: ask the destination what it already has, send the
+rest, delete nothing. `tuf-ci publish` does exactly that against a directory, skipping
+files already there with the right bytes.
+
+Files go out in dependency order — artifacts, then the metadata describing them, then
+`snapshot`, and `timestamp` last — so the live `timestamp.json` never names something that
+has not been uploaded yet. An upload that dies halfway leaves the previous repository
+working and some unreferenced files behind.
+
+That is the whole design for an object store, and `tuf_repo::publish::Sink` is the seam:
+one `ListObjectsV2` to learn what the bucket holds, a `PUT` per missing file in the order
+the plan gives them, no delete pass, and the two mutable names always rewritten. Old
+versions stay: a `4.snapshot.json` nobody points at any more costs a few kilobytes and is
+the difference between a client mid-update carrying on and a client failing.
+
 ## How roles work
 
 `root` delegates to `root`, `targets`, `snapshot` and `timestamp`. The top-level `targets`
@@ -224,13 +289,13 @@ event; a branch that changes them is reported as an error.
 
 ## Not implemented yet
 
-The repository can be administered but not yet published. Still to come:
+The repository can be administered and published, but nothing yet produces the online
+roles a publish needs, or uploads the result. Still to come:
 
 - **online signing** — snapshot and timestamp signed with a KMS key when an event merges;
 - **scheduled expiry events** — the cron job that opens `sign/<role>-vN` when a role enters
   its signing period;
-- **publish and verify** — building the consistent-snapshot tree for GitHub Pages and
-  smoke-testing it with a client.
+- **uploading** — an S3 `Sink`, and the workflow that runs it on a merge to `main`.
 
 The metadata format and the `tuf-repo` API are shaped so each of these is an addition
 rather than a rework.
